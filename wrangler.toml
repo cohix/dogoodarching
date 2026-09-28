@@ -1,0 +1,27 @@
+# Cloudflare Workers configuration for Do Good Arching.
+#
+# BEFORE FIRST DEPLOY:
+#   1. npx wrangler d1 create do-good-arching
+#      -> paste the returned database_id below (replacing the placeholder)
+#   2. npx wrangler r2 bucket create do-good-arching-attachments
+#   3. npm run db:migrate   (applies migrations/ to the remote D1 database)
+
+name = "do-good-arching"
+main = "src/index.ts"
+compatibility_date = "2026-09-25"
+
+[assets]
+directory = "./dist/client"
+not_found_handling = "single-page-application"
+# API routes must hit the Worker first; otherwise the SPA fallback would
+# serve index.html for /api/* requests.
+run_worker_first = ["/api/*"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "do-good-arching"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+
+[[r2_buckets]]
+binding = "ATTACHMENTS"
+bucket_name = "do-good-arching-attachments"

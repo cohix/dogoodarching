@@ -1,0 +1,84 @@
+// Do Good Arching service worker — app shell caching only.
+//
+// Rules:
+// - `/api/*` is NEVER cached: every API request goes straight to the network,
+//   because the Worker/D1 backend is always the source of truth.
+// - Navigations (including `/invite/<token>` deep links, served index.html by
+//   the Worker's SPA fallback) serve the cached shell offline and refresh it
+//   online.
+// - Built assets under `/assets/` are runtime-cached cache-first.
+
+const CACHE_NAME = "dga-shell-v1";
+
+const APP_SHELL = [
+  "/",
+  "/index.html",
+  "/manifest.webmanifest",
+  "/icons/icon-192.png",
+  "/icons/icon-512.png",
+  "/icons/maskable-512.png",
+  "/icons/apple-touch-icon.png",
+];
+
+self.addEventListener("install", (event) => {
+  event.waitUntil(
+    caches
+      .open(CACHE_NAME)
+      .then((cache) => cache.addAll(APP_SHELL))
+      .then(() => self.skipWaiting()),
+  );
+});
+
+self.addEventListener("activate", (event) => {
+  event.waitUntil(
+    caches
+      .keys()
+      .then((keys) =>
+        Promise.all(keys.filter((key) => key !== CACHE_NAME).map((key) => caches.delete(key))),
+      )
+      .then(() => self.clients.claim()),
+  );
+});
+
+self.addEventListener("fetch", (event) => {
+  const request = event.request;
+  const url = new URL(request.url);
+
+  // Only handle same-origin GETs.
+  if (url.origin !== self.location.origin || request.method !== "GET") return;
+
+  // The API is always the source of truth — never serve or store API responses.
+  if (url.pathname.startsWith("/api/")) return;
+
+  // Navigations ("/", "/invite/<token>", …): network first so deep links load
+  // fresh; fall back to the cached shell when offline.
+  if (request.mode === "navigate") {
+    event.respondWith(
+      fetch(request)
+        .then((response) => {
+          const copy = response.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put("/index.html", copy));
+          return response;
+        })
+        .catch(() => caches.match("/index.html")),
+    );
+    return;
+  }
+
+  // Built assets (hashed JS/CSS/images): cache-first, then network.
+  if (url.pathname.startsWith("/assets/")) {
+    event.respondWith(
+      caches.match(request).then(
+        (hit) =>
+          hit ??
+          fetch(request).then((response) => {
+            if (response.ok) {
+              const copy = response.clone();
+              caches.open(CACHE_NAME).then((cache) => cache.put(request, copy));
+            }
+            return response;
+          }),
+      ),
+    );
+  }
+});
