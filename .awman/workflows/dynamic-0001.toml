@@ -1,0 +1,870 @@
+# awman workflow for work item 0001: architecture remediation.
+#
+# Shape of the run
+#   setup: npm ci
+#   harness ─────────────────┐            frontend-split ─┐
+#   schema-team-auth         │ (backend chain, shared     │ (frontend/src only,
+#   restructure-services     │  files -> sequential)      │  runs alongside the
+#   tracker-fixes ───────────┘                            │  backend chain)
+#        ├── tests-auth-team                              │
+#        └── frontend-features <───────────────────────────┘
+#                 ├── tests-tracker
+#                 └── aspec-docs
+#   review-backend + review-frontend-docs  (independent reviewers, findings only)
+#   remediate  ->  verify-remediation (abort on failure)
+#   teardown: typecheck + lint + schema no-diff + tests + build, commit, push, PR
+#
+# Agents alternate between claude and codex so that every implementation step is
+# tested and reviewed by a different assistant than the one that wrote it.
+# No models are set: the agent listing names none, so the repo default applies.
+
+title = "0001 Architecture remediation"
+teardown_on_failure = false
+
+# Every agent step gets the run-scoped shared context directory.
+overlays = ["context(workflow)"]
+
+# ── Setup ─────────────────────────────────────────────────────────────────────
+
+[[setup]]
+type = "run_shell"
+command = "npm ci"
+abort_on_failure = true
+
+# ── Agent steps ───────────────────────────────────────────────────────────────
+
+[[step]]
+name = "harness"
+agent = "claude"
+prompt = '''
+You are working on work item {{work_item_number}} in the Do Good Arching repository
+(Cloudflare Workers + D1 + R2, Hono, Drizzle, React SPA; see README.md and REVIEW.md).
+This step delivers the test harness, lint, CI/CD and repo hygiene: work item
+sections 2 (Test harness, CI and lint) and 12 (Repo hygiene). It runs FIRST so
+every later step can run `npm test` and `npm run lint`.
+
+DO in this step:
+1. Test harness. Add `vitest` and `@cloudflare/vitest-pool-workers` as devDependencies.
+   Configure a vitest workspace with two projects:
+   - `worker`: pool-workers, reading `wrangler.toml`, with D1 migrations from
+     `migrations/*.sql` applied per test file (use `readD1Migrations` in a global
+     setup and `applyD1Migrations` in a per-file setup) and the R2 `ATTACHMENTS`
+     binding bound. Provide a small shared helper (for example `test/helpers.ts`)
+     that later test authors can use to issue requests against the Worker via
+     `SELF.fetch`, bootstrap a coach, log in and carry the session cookie.
+   - `frontend`: a jsdom or happy-dom environment for unit tests under
+     `frontend/src/**/*.test.ts(x)`.
+   Add scripts: `test` (both projects), `test:worker`, `test:frontend`.
+   Make sure TypeScript covers the test files (a `test/tsconfig.json` or an
+   include in the existing configs) without breaking `npm run typecheck`.
+   Seed exactly one smoke test per project so the harness is proven to work:
+   worker: `GET /api/auth/status` returns 200 and the D1 tables exist after
+   migrations; frontend: a trivial render or pure-function test. Do NOT write the
+   feature test suite here; dedicated test steps do that later.
+2. Lint. Add ESLint with typescript-eslint and a minimal flat config covering `src`,
+   `frontend/src` and `test`. Include a `no-restricted-syntax` /
+   `no-restricted-properties` rule that forbids any `.transaction(` call (D1 rejects
+   it; see REVIEW.md C1). Add an `npm run lint` script. `db.transaction()` is still
+   present in `src/routes/auth.ts` and will be removed by the next step, so the
+   lint rule is expected to flag those two call sites right now; that is correct.
+   Everything else must lint clean.
+3. Environments. Add `[env.preview]` to `wrangler.toml` with its own Worker name,
+   D1 database (`binding = "DB"`) and R2 bucket (`binding = "ATTACHMENTS"`),
+   using clearly labelled placeholder IDs. Production keeps the top-level config.
+   Add `deploy:preview` and `db:migrate:preview` scripts.
+4. CI/CD under `.github/workflows/`:
+   - `ci.yml`: on every pull request and push: `npm ci`, `npm run typecheck`,
+     `npm run lint`, `npm run db:check`, `npm test`, then `npm run build`.
+     (`db:check` is the drizzle-kit no-diff check that the next step adds; wire
+     it into CI now.)
+   - `deploy-preview.yml`: on push to `main`, after the same checks pass, apply
+     remote migrations to the preview D1 and then deploy the Worker to preview.
+   - `deploy-production.yml`: `workflow_dispatch` with a `sha` input defaulting to
+     current `main`, using a GitHub environment named `production` that requires
+     approval; it checks out that SHA, runs the checks, applies production
+     migrations, then deploys.
+   - Cloudflare API token and account ID come from GitHub environment secrets
+     (document the required scopes in a comment: Workers, D1, R2). Set the
+     Worker's version message or tag to the git SHA on every deploy. Versioning
+     is trunk-based on `main`; do not bump or use the `package.json` version.
+5. Repo hygiene. Add a `.gitignore` covering `node_modules/`, `dist/`, `.wrangler/`,
+   `.dev.vars`, `.DS_Store` and `*.log`. Delete the tracked `.DS_Store`. Add a clear
+   README callout (or a startup failure message in the Worker) for the placeholder
+   `database_id` in `wrangler.toml`.
+
+DO NOT in this step:
+- Do not change product code in `src/` or `frontend/src/` (the only exception is
+  a startup check for the placeholder `database_id`, if you choose that option).
+- Do not fix C1, do not touch the schema, migrations or `drizzle.config.ts`.
+- Do not touch `.awman/` or `aspec/` (including `aspec/devops/subagents.md`).
+- Another agent is concurrently splitting `frontend/src/App.tsx` into feature
+  folders. Never edit anything under `frontend/src/`, and treat transient
+  typecheck or lint errors under `frontend/src/` as noise from that work. Lint
+  and typecheck `src/` and `test/` to verify your own work.
+
+Success criteria you can check yourself:
+- `npm test` runs both projects and the two smoke tests pass; the worker project
+  applies migrations without a Cloudflare login.
+- `npm run lint` reports only the `.transaction(` violations in `src/routes/auth.ts`.
+- `npm run typecheck` passes for the Worker project (`tsc --noEmit -p tsconfig.worker.json`).
+- `npx wrangler deploy --dry-run --env preview` parses the new environment config
+  (if the dry run needs credentials, at least confirm `wrangler.toml` parses).
+- The three workflow YAML files are valid YAML.
+
+Before finishing, write `/awman/context/workflow/harness-notes.md` for later steps:
+the script names, where test files live and how they are named, how to use the
+test helpers (bootstrap/login/cookie, applying migrations, R2 binding), how to run
+a single test file, and any quirks you hit (compatibility flags, tsconfig, timeouts).
+
+Work item (full text; also at aspec/work-items/0001-architecture-remediation.md):
+{{work_item_content}}
+'''
+
+[[step]]
+name = "frontend-split"
+agent = "codex"
+prompt = '''
+You are working on work item {{work_item_number}} in the Do Good Arching repository
+(React 19 + Tailwind v4 + TanStack Query SPA under `frontend/`). This step is the
+frontend half of section 4 (Module restructure): split `frontend/src/App.tsx`
+(about 1,200 lines) into per-feature components.
+
+DO:
+- Create `frontend/src/features/` with one folder per feature: auth, dashboard,
+  log, plan, gear, fuel, team, settings. Move each feature's components, hooks and
+  local helpers there.
+- Create `frontend/src/components/` for shared UI (for example `SafeLink`, `Empty`,
+  buttons, layout, navigation). Keep `athleteNav` / `coachNav` and the `Empty`
+  component pattern recognisable, since the aspec will document them.
+- Move `safeHttpUrl` and `SafeLink` into `frontend/src/components/` so a later step
+  can rewrite and unit-test them, but keep their current behaviour unchanged here.
+- `App.tsx` becomes a thin shell: routing/tab state, providers, feature mounting.
+- Keep `frontend/src/api.ts` exactly as it is; the backend API is unchanged during
+  this step and other steps type against it.
+
+DO NOT:
+- Do not change behaviour, markup, styling or API calls. This is a pure move/split
+  refactor. Do not implement sections 6, 8, 9, 12 or 13 of the work item; a later
+  `frontend-features` step does that.
+- Do not write tests.
+- Do not edit anything outside `frontend/src/`. In particular do not touch
+  `package.json`, `package-lock.json`, root config files, `src/`, `aspec/` or
+  `.awman/`. Another agent is concurrently editing root config and adding
+  devDependencies; `node_modules` may churn for a few minutes. If a command fails
+  for that reason, wait briefly and retry.
+- Do not run `npm run build` or `npm run typecheck` as your gate (they include the
+  Worker project and root config that the other agent is changing). Verify with
+  `npx tsc --noEmit -p frontend/tsconfig.json` and, if it works in this
+  environment, `npx vite build --config frontend/vite.config.ts`.
+
+Success criteria:
+- `npx tsc --noEmit -p frontend/tsconfig.json` passes.
+- `App.tsx` is under roughly 200 lines and no feature file exceeds roughly 400 lines.
+- No component was dropped: every tab and screen that existed before still renders
+  the same JSX tree (diff the rendered structure by reading, not by guessing).
+
+Before finishing, write `/awman/context/workflow/frontend-layout.md`: the folder
+layout, which component lives where, where `SafeLink`/`safeHttpUrl`, the Team tab,
+the dashboard program-state UI, the plan defaults UI and the SPT band-workout image
+UI now live, and anything the next frontend step should know.
+
+Work item (full text; also at aspec/work-items/0001-architecture-remediation.md):
+{{work_item_content}}
+'''
+
+[[step]]
+name = "schema-team-auth"
+agent = "codex"
+depends_on = ["harness"]
+prompt = '''
+You are working on work item {{work_item_number}} in the Do Good Arching repository.
+Read `/awman/context/workflow/harness-notes.md` first: the test harness, lint and
+CI exist now. This step delivers the blocking fix and the data-model changes:
+work item sections 1 (C1: replace D1 transactions with batches), 3 (single schema
+source of truth and referential integrity), 13 (shared coaching team and owner
+role, backend only), 10 (timestamp convention, code side), and the backend parts
+of section 8 that live in the schema and migration (nullable `current_poundage`,
+the `program_state` backfill, dropping the unused `entries` table).
+
+DO, in this order:
+1. drizzle-kit. Add `drizzle-kit` and `drizzle.config.ts` (dialect sqlite, driver
+   d1-http, schema `src/db/schema.ts`, out `migrations/`). First make `schema.ts`
+   describe exactly what `migrations/0001_init.sql` creates (move every index into
+   `schema.ts`, including the `lower(username)` unique index using the
+   `uniqueIndex(...).on(sql`lower(...)`)` form shown in section 3 of the work item),
+   then create the drizzle-kit journal/snapshot baseline that corresponds to the
+   existing hand-written `0001_init.sql` (do not rewrite 0001; make the meta
+   snapshot match it). Add scripts `db:generate` (drizzle-kit generate) and
+   `db:check`, which runs generate and fails if it produced any change under
+   `migrations/` (for example via `git status --porcelain migrations`). The CI
+   workflow already calls `npm run db:check`.
+2. Schema changes in `schema.ts` (section 13 and 3): `users.is_owner` boolean default
+   false with a partial unique index `WHERE is_owner = 1`; replace `users.coach_id`
+   with `users.invited_by` (nullable FK to `users.id`, ON DELETE SET NULL);
+   `invites.role` ('athlete' | 'coach', default 'athlete'); rename
+   `invites.coach_id` to `invites.created_by`; foreign keys from every `user_id`
+   column to `users(id) ON DELETE CASCADE`; drop the `entries` table; make
+   `program_state.current_poundage` nullable. Do not add an index to `rate_limits`.
+   Apply the section 10 timestamp convention: document it in a comment at the top
+   of `schema.ts` (instants are epoch-ms integers via `timestamp_ms`; calendar
+   dates are `YYYY-MM-DD` strings in the athlete's local calendar supplied by the
+   client as `today`) and switch `sessions.expires_at` and `invites.expires_at`
+   to the same Drizzle mode, or add a comment explaining why they differ.
+3. Migration `0002_*`. Generate it with drizzle-kit, then review and edit it by hand
+   (SQLite needs table rebuilds for FKs). It must: add the FKs; apply the users and
+   invites changes; mark the existing coach (if any) as owner; copy `coach_id` into
+   `invited_by`, setting NULL where the target user is missing; drop `entries`;
+   backfill a `program_state` row of poundage 24 / cycle 2 / week 6 anchored to the
+   migration date for every existing user with no row, checking the anchor against
+   `datedProgramState` so backfilled users land on exactly the week they see today;
+   and handle orphan rows whose `user_id` has no matching user by either deleting
+   them or failing loudly (pick one, comment why). It must migrate a fresh empty DB
+   and a DB with the single existing coach cleanly. Keep `db:check` green
+   afterwards (the snapshot must match the edited SQL).
+4. C1 (section 1). Remove every `db.transaction()` call. Bootstrap becomes one
+   `INSERT ... SELECT ... WHERE NOT EXISTS (SELECT 1 FROM users)` setting
+   `role='coach', is_owner=1`; `meta.changes !== 1` maps to 409. Accept-invite
+   becomes one `db.batch([...])`: claim the invite (`UPDATE invites SET used_at=?
+   WHERE id=? AND used_at IS NULL AND expires_at > ?`), then insert the user with
+   the invite's role and `invited_by = created_by` guarded by `WHERE EXISTS
+   (SELECT 1 FROM invites WHERE id=? AND used_at=?)`; for coach invites the guard
+   also requires the creator to still be the owner. "Claim changed 0 rows" maps to
+   410, a username UNIQUE violation to 409 and, because the batch is atomic, the
+   claim rolls back. Remove the incorrect "race-safe" comments.
+5. Team model backend (section 13). `resolveAthlete` checks `role = 'athlete'` only.
+   `GET /api/coach/athletes` returns every athlete. `getAttachmentForDownload` allows
+   the attachment's owner or any coach. Coaches still never see private logs.
+   `POST /api/auth/invites` takes `{ role }` defaulting to "athlete"; `role: "coach"`
+   only for the owner (403 otherwise). Add invite listing and revoking endpoints
+   (owner: all invites; other coaches: only their own) and an endpoint that lists
+   coaches for the owner's Team tab. Add `isOwner` to `/api/auth/me` and
+   `publicUser`; drop `coachId` from responses. Keep every other response shape
+   unchanged: `frontend/src/api.ts` is typed against them.
+6. Remove `entries` from the schema, export and import; import must still accept
+   and ignore an `entries` key from old export files. Replace the hard-coded
+   default program state with one constant: cycle 1, week 1, poundage unset.
+   (The dashboard poundage prompt and starter plan rewrite are done in later
+   steps; here only the constant, the nullable column and the backfill.)
+
+DO NOT:
+- Do not restructure modules (section 4), do not touch `frontend/` (another agent is
+  splitting `App.tsx` right now), do not fill in `aspec/`, do not touch `.awman/`.
+- Do not start work item 0002 items (CSRF, headers, upload quotas, rate limiting).
+- Do not write the comprehensive test suite. You MAY add the minimal tests you need
+  to prove your change actually runs on D1 (for example bootstrap succeeds,
+  accept-invite succeeds, migrations apply to an empty DB); the full matrix comes
+  later in `tests-auth-team`.
+- Verify with `npm run typecheck` for the Worker project only
+  (`npx tsc --noEmit -p tsconfig.worker.json`), `npm run lint`, `npm run db:check`
+  and `npm run test:worker`. Ignore transient errors under `frontend/src/`.
+
+Success criteria:
+- `grep -rn "transaction(" src` finds nothing and `npm run lint` is clean.
+- `npm run db:check` passes; `migrations/` contains 0001, 0002 and the drizzle meta.
+- `npm run test:worker` passes, including your proof-of-work tests for bootstrap and
+  accept-invite against D1.
+- Bootstrap twice returns 201 then 409; accepting the same invite twice returns 201
+  then 410; a taken username returns 409 without consuming the invite.
+
+Before finishing, write `/awman/context/workflow/backend-api-changes.md` listing every
+endpoint added or changed (method, path, request body, response body, status codes),
+the new default program-state constant and where it lives, the migration's decisions
+(orphan handling, backfill anchor), and anything non-obvious about the drizzle-kit
+baseline. Later steps (frontend, tests, docs) rely on this file.
+
+Work item (full text; also at aspec/work-items/0001-architecture-remediation.md):
+{{work_item_content}}
+'''
+
+[[step]]
+name = "restructure-services"
+agent = "claude"
+depends_on = ["schema-team-auth"]
+prompt = '''
+You are working on work item {{work_item_number}} in the Do Good Arching repository.
+Read `/awman/context/workflow/harness-notes.md` and
+`/awman/context/workflow/backend-api-changes.md` first. This step is the backend
+half of section 4 (Module restructure). The schema, migrations, C1 fix and team
+model are already done; do not redo them.
+
+DO:
+- `src/lib/validation.ts`: every Zod schema and enum (`sessionInput`, `httpUrl`,
+  `dateInput`, ...), shared by the write endpoints and by import.
+- `src/lib/dates.ts`: `isoWeekKey`, `mondayDate`, `datedProgramState`,
+  `shiftProgramState`, `addUtcDays`, `dateKeyUtc`.
+- `src/lib/http.ts`: JSON body reading, error helpers, `parsePositiveInt` (currently
+  duplicated in `tracker.ts` and `coach.ts`).
+- `src/services/*.ts`: domain functions taking `(db, userId, input)`, split by area:
+  plan, sessions, scores, maintenance, setups, inspiration, attachments, transfer
+  (export/import). Auth/session helpers stay in `src/lib/auth.ts` and `src/lib/rbac.ts`.
+- `src/routes/*.ts`: thin handlers only. No route module imports from another route
+  module.
+- Add `@hono/zod-validator` and replace the roughly 25 copies of the
+  read-body/parse/400 boilerplate with it. Keep the error body shape
+  `{ error: string }` and the existing status codes; use a custom hook or wrapper so
+  validation failures still return exactly `{ error: string }` with 400.
+- Preserve every API path, request shape and response shape. `frontend/src/api.ts`
+  is typed against them and must keep compiling unchanged.
+
+DO NOT:
+- Do not change behaviour beyond the move. Sections 5, 6, 7, 8, 11 (performance,
+  404 on no-match, atomic writes, leftovers, download filename) are done in the
+  next step, `tracker-fixes`, inside the services you create here. Leave TODO-free
+  code; just do not implement those items.
+- Do not touch `frontend/`, `aspec/`, `.awman/`, `migrations/` or `schema.ts`.
+- Do not write tests. Existing tests must keep passing.
+
+Success criteria:
+- `npx tsc --noEmit -p tsconfig.worker.json`, `npm run lint`, `npm run db:check` and
+  `npm run test:worker` all pass. Ignore transient errors under `frontend/src/`.
+- `src/routes/tracker.ts` and `src/routes/coach.ts` contain handlers only (aim for
+  under about 150 lines each); no `src/routes/*` file imports another `src/routes/*`.
+- `grep -rn "parsePositiveInt" src` shows one definition.
+
+Before finishing, write `/awman/context/workflow/module-layout.md`: every new module,
+what it owns, the service function names per area, how validation is wired
+(`@hono/zod-validator` + hook), and which service functions later steps should edit
+for sections 5, 6, 7, 8 and 11 (name the function and file for each).
+
+Work item (full text; also at aspec/work-items/0001-architecture-remediation.md):
+{{work_item_content}}
+'''
+
+[[step]]
+name = "tracker-fixes"
+agent = "codex"
+depends_on = ["restructure-services"]
+prompt = '''
+You are working on work item {{work_item_number}} in the Do Good Arching repository.
+Read `/awman/context/workflow/harness-notes.md`,
+`/awman/context/workflow/backend-api-changes.md` and
+`/awman/context/workflow/module-layout.md` first. The backend now has the new
+module layout (`src/lib`, `src/services`, thin `src/routes`). This step fixes the
+remaining backend findings inside that layout: work item sections 5, 6, 7, the
+backend parts of 8, and 11.
+
+DO:
+- Section 5 (dashboard payload performance, `getTrackerPayload`): compute weekly arrow
+  totals and the session-date set in SQL (`GROUP BY` week, `DISTINCT session_date`)
+  limited to the date range the cycle summaries need; load practice-score ends only
+  for the at most 100 returned score IDs (`inArray`); keep the 100-row session cap
+  and add cursor pagination `?before=` for history, with a deterministic order on
+  `(session_date, id)` so same-date sessions and id ties page correctly. Auth
+  middleware: one query joining `sessions` and `users` instead of two.
+- Section 6 (mutations report not-found): `updateSessionFor`, `deleteSessionFor`,
+  `deletePracticeScoreFor`, `updateMaintenanceItemFor`, `deleteMaintenanceItemFor`,
+  and `saveSetupFor` when an `id` is given, check `meta.changes` and return 404
+  when nothing matched.
+- Section 7 (atomic writes): `addPracticeScoreFor` inserts the score and its ends in
+  one batch (subquery or pre-read ID; never `max(id)`); `clearMaintenanceSectionFor`
+  becomes one `INSERT ... SELECT ... ON CONFLICT DO UPDATE` or one batch;
+  `addMaintenanceItemFor` computes `sort_order` inside the insert with
+  `COALESCE((SELECT MAX(sort_order)+1 ...), 0)`.
+- Section 8 backend: `plannedSessionDefaults` becomes a generic 7-day starter template
+  with neutral session types and short descriptions and no personal prescriptions;
+  existing saved overrides are unaffected. Confirm the single default-program-state
+  constant (cycle 1, week 1, poundage unset) is used everywhere a new user's state
+  is created or read, and that the tracker payload exposes "poundage not set" so the
+  frontend can prompt for it. Keep the API response shape for program state
+  compatible apart from `currentPoundage` now being nullable.
+- Section 11 (download filename): send
+  `Content-Disposition: attachment; filename="<ascii-fallback>"; filename*=UTF-8''<percent-encoded>`
+  with the extension matching the MIME type. Put the builder in a small pure
+  function in `src/lib/http.ts` so it can be unit-tested (non-ASCII, quotes).
+- Remove the `frontend/src/assets/wednesday-spt-band-workout-page-*.png` files ONLY
+  if nothing under `frontend/src` still imports them; otherwise leave them and note
+  it in your handoff (the `frontend-features` step removes the UI and the files).
+
+DO NOT:
+- Do not touch `frontend/src/`, `aspec/`, `.awman/`, `migrations/` or `schema.ts`.
+- Do not change API paths or response shapes except where the work item says
+  (`?before=` is additive; `currentPoundage` nullable; 404s on no-match).
+- Do not write the comprehensive test suite. You MAY add minimal tests proving the
+  atomic batch and the 404 paths work on D1; `tests-tracker` writes the full set.
+- Do not start 0002 items.
+
+Success criteria:
+- `npx tsc --noEmit -p tsconfig.worker.json`, `npm run lint`, `npm run db:check`
+  and `npm run test:worker` pass.
+- `grep -rn "max(id)" src` and `grep -rni "cycle 2" src` find nothing.
+- Deleting a session that belongs to another user returns 404, not 200.
+
+Before finishing, append to `/awman/context/workflow/backend-api-changes.md` a section
+"tracker-fixes" listing: the `?before=` cursor semantics, the exact program-state
+payload shape including the not-set case, the starter-plan template content, which
+mutations now return 404, the Content-Disposition builder's name and location, and
+anything the frontend must change to consume these.
+
+Work item (full text; also at aspec/work-items/0001-architecture-remediation.md):
+{{work_item_content}}
+'''
+
+[[step]]
+name = "frontend-features"
+agent = "claude"
+depends_on = ["tracker-fixes", "frontend-split"]
+prompt = '''
+You are working on work item {{work_item_number}} in the Do Good Arching repository.
+Read `/awman/context/workflow/frontend-layout.md` and
+`/awman/context/workflow/backend-api-changes.md` first. The SPA is already split
+into `frontend/src/features/*` and `frontend/src/components/*`, and the backend
+changes are complete. This step delivers every frontend behaviour change in the
+work item: section 9 (attachment links, M5), the frontend parts of sections 6, 8
+and 13, and the service-worker part of section 12.
+
+DO:
+- `frontend/src/api.ts`: add `isOwner` to the user type, remove `coachId`, add the
+  invite `role` field, the invite list/revoke endpoints, the coaches list endpoint,
+  the `?before=` cursor parameter, and nullable `currentPoundage`, exactly as
+  described in `backend-api-changes.md`.
+- Section 13 UI: the Team tab lists all athletes (no "my team" wording anywhere);
+  the owner sees "Invite coach" next to "Invite athlete" and a list of coaches;
+  invite listing/revoking follows the owner/coach visibility rules.
+- Section 8 UI: label the default weekly plan as a starter plan that the athlete or a
+  coach can edit; when `currentPoundage` is not set, the dashboard asks the athlete
+  for their poundage before showing poundage-dependent content and saves it to
+  program state; remove the SPT band-workout image UI and delete the
+  `frontend/src/assets/wednesday-spt-band-workout-page-*.png` files (and
+  `assets.d.ts` if nothing else needs it).
+- Section 9: `safeHttpUrl` resolves against `window.location.origin`
+  (`new URL(value, window.location.origin)`), allows http/https, and allows
+  same-origin paths only under `/api/plan/attachments/`. For same-origin file links
+  do not use `target="_blank"` with `noopener` (that can drop the session in some
+  PWA contexts); use a plain link or a `download` attribute. Keep it a small pure
+  function in `frontend/src/components/` so it can be unit-tested; the "Open" link
+  must now render for uploaded files.
+- Section 6 UI: make sure every mutation the backend now answers with 404 (session
+  update/delete, score delete, maintenance update/delete, setup save) is handled:
+  on 404 invalidate and refetch the affected query instead of leaving stale
+  optimistic state; a double-click delete must not show an error dialog.
+- Section 5 UI: if a history screen lists sessions, use the `?before=` cursor to load
+  older sessions.
+- Section 12 service worker: inject a build hash into `CACHE_NAME` from a Vite plugin
+  or build step so each deploy creates a new cache, and make `activate` delete old
+  caches (including the current `dga-shell-v1`). API requests stay network-only.
+
+DO NOT:
+- Do not touch `src/`, `migrations/`, `aspec/`, `.awman/` or the test harness config.
+- Do not write tests (except that you may leave the small frontend smoke test intact);
+  `tests-tracker` writes the frontend unit tests.
+- Another agent may be adding backend test files under `test/` at the same time. Do
+  not run the worker test project as your gate; verify with `npm run typecheck`,
+  `npm run lint`, `npm run test:frontend` and `npm run build`.
+
+Success criteria:
+- `npm run typecheck`, `npm run lint`, `npm run test:frontend` and `npm run build` pass.
+- `grep -rni "my team" frontend/src` finds nothing; `grep -rn "coachId" frontend/src`
+  finds nothing; `grep -rn "spt-band" frontend/src` finds nothing.
+- `dist/client/sw.js` (after build) contains a cache name that includes a build hash.
+
+Before finishing, write `/awman/context/workflow/frontend-changes.md`: where each
+behaviour lives (file and component), the `safeHttpUrl` rules and function location,
+how the 404 handling works, how the service-worker hash is injected, and the manual
+click-through a reviewer should perform.
+
+Work item (full text; also at aspec/work-items/0001-architecture-remediation.md):
+{{work_item_content}}
+'''
+
+[[step]]
+name = "tests-auth-team"
+agent = "claude"
+depends_on = ["tracker-fixes"]
+prompt = '''
+You are writing tests for work item {{work_item_number}} in the Do Good Arching
+repository. Read `/awman/context/workflow/harness-notes.md`,
+`/awman/context/workflow/backend-api-changes.md` and
+`/awman/context/workflow/module-layout.md` first. You did not implement the
+code; treat it adversarially and try to make it fail. This step owns the auth,
+invite, RBAC, team-model and schema/migration tests in the `worker` vitest
+project. A sibling step, `tests-tracker`, owns tracker/service and frontend tests
+at the same time, so only create files matching `test/auth*`, `test/invite*`,
+`test/rbac*`, `test/team*` and `test/migration*` (or the equivalent under the
+harness's naming), and only run your own files
+(`npx vitest run --project worker test/auth...`), never the whole suite.
+
+Write integration tests (vitest-pool-workers, real D1 with migrations applied) for:
+- bootstrap: success, second bootstrap 409, and a concurrent double-bootstrap via
+  `Promise.all` giving exactly one 201 and one 409 with no orphan user and no 500;
+- invite accept: expired (410), reused (410), concurrent accept of the same token
+  (one 201, one 410), taken username (409 and the invite is NOT consumed), an
+  invite that expires between the read and the batch, an athlete invite whose
+  creating coach was deleted (still accepted), a coach invite whose creator is no
+  longer the owner at accept time (410), accept-invite gives the invite's role and
+  sets `invited_by`;
+- login/logout, and `/api/auth/me` returning `isOwner`;
+- RBAC matrix across every `/api/coach/*` route: an athlete gets 403 (or the code the
+  implementation uses consistently) on `/api/coach/*`; any coach can reach any
+  athlete; a coach cannot use coach endpoints on another coach's account; an athlete
+  cannot download another athlete's attachment (404); only the owner can create
+  coach invites (non-owner coach gets 403); any coach can create athlete invites;
+  invite listing/revoking visibility (owner sees all, others only their own);
+- team model: two coaches both see and can edit the same athlete's plan;
+- schema/migrations: migrations apply cleanly to an empty DB; applying 0002 on top
+  of a DB seeded with 0001 data (one coach, athletes with `coach_id`, an athlete
+  whose `coach_id` points at a missing user, users with and without `program_state`,
+  rows in `entries`) marks the coach as owner, sets `invited_by` (NULL for the
+  missing target), drops `entries`, and backfills `program_state` so each existing
+  user lands on exactly the cycle/week/poundage they saw before; a DB with no coach
+  migrates cleanly; orphan rows are handled the way the migration documents.
+
+Rules:
+- Do not modify product code. If you find a bug, write the failing test, keep it in
+  the suite, and record it in `/awman/context/workflow/test-findings.md` with the
+  file, the expected and actual behaviour, and your assessment. The review and
+  remediation steps will fix it. Do not skip or weaken a test to make it green.
+- Do not edit the vitest config, the shared helpers (extend them only by adding new
+  exported helpers in a new file) or anything under `frontend/`, `aspec/`, `.awman/`.
+- Tests must be deterministic and independent; each file gets fresh migrations.
+
+Success criteria:
+- Every scenario above has a test; your files pass except for tests documenting a
+  real bug, which are listed in `test-findings.md`.
+- `npm run lint` and `npx tsc --noEmit` for the test project pass on your files.
+
+Before finishing, write `/awman/context/workflow/tests-auth-team-coverage.md`: a list
+of test files and the scenarios each covers, plus anything not covered and why.
+
+Work item (full text; also at aspec/work-items/0001-architecture-remediation.md):
+{{work_item_content}}
+'''
+
+[[step]]
+name = "tests-tracker"
+agent = "claude"
+depends_on = ["tracker-fixes", "frontend-features"]
+prompt = '''
+You are writing tests for work item {{work_item_number}} in the Do Good Arching
+repository. Read `/awman/context/workflow/harness-notes.md`,
+`/awman/context/workflow/backend-api-changes.md`,
+`/awman/context/workflow/module-layout.md` and
+`/awman/context/workflow/frontend-changes.md` first. You did not implement the
+code; treat it adversarially and try to make it fail. This step owns tracker,
+service, unit and frontend tests. A sibling step, `tests-auth-team`, owns
+`test/auth*`, `test/invite*`, `test/rbac*`, `test/team*` and `test/migration*` at
+the same time: never create or edit those files, and only run your own files
+(`npx vitest run --project worker test/tracker...`, `npm run test:frontend`), never
+the whole worker suite.
+
+Write:
+- Integration tests (worker project, real D1):
+  - 404 for each mutation (session update/delete, score delete, maintenance
+    update/delete, setup save with an id) when the target ID belongs to another user
+    or does not exist;
+  - practice score insert is atomic: force a failure in the ends insert and assert no
+    orphan score row remains;
+  - maintenance section clear works and is idempotent;
+  - `sort_order` stays unique and ordered under concurrent `Promise.all` adds;
+  - defaults: a new athlete gets cycle 1 / week 1, no poundage, and the starter plan;
+    the tracker payload reports poundage as not set; saving a poundage persists it;
+  - pagination: `?before=` with several sessions on the same date and id ties returns
+    every session exactly once across pages, in a stable order;
+  - export omits `entries`; import accepts and ignores an `entries` key from an old
+    export file;
+  - attachment download sends the Content-Disposition described in section 11 and
+    the owner or any coach can download, another athlete gets 404;
+  - performance smoke: seed 5,000 sessions and 1,000 practice scores for one user,
+    then assert `GET /api/tracker` returns within a flat budget and, if the harness
+    exposes it, a flat D1 query count compared with a 100-session user. Use a
+    per-test timeout; keep the seeding in batches.
+- Unit tests:
+  - `src/lib/dates.ts`: ISO week keys at year boundaries, `datedProgramState` across
+    cycle rollover, negative shifts clamped at 0;
+  - the Content-Disposition builder with non-ASCII and quote characters;
+  - frontend (`frontend` vitest project): `safeHttpUrl` with relative URLs, absolute
+    same-origin URLs under and outside `/api/plan/attachments/`, cross-origin http
+    and https links, javascript: and malformed values; `SafeLink` renders a plain
+    link (no `target="_blank"`) for same-origin file links.
+
+Rules:
+- Do not modify product code. If you find a bug, keep the failing test and record it
+  in `/awman/context/workflow/test-findings.md` (file, expected, actual, assessment).
+  Do not skip or weaken tests.
+- Do not edit the vitest config or the shared helpers (add new helper files instead),
+  and do not touch `aspec/` or `.awman/`.
+- Tests must be deterministic and independent.
+
+Success criteria:
+- Every scenario above has a test; your files pass except for tests documenting a
+  real bug, listed in `test-findings.md`.
+- `npm run lint` and the test-project typecheck pass on your files.
+
+Before finishing, write `/awman/context/workflow/tests-tracker-coverage.md`: test files,
+scenarios covered, the measured performance numbers, and anything not covered and why.
+
+Work item (full text; also at aspec/work-items/0001-architecture-remediation.md):
+{{work_item_content}}
+'''
+
+[[step]]
+name = "aspec-docs"
+agent = "codex"
+depends_on = ["tracker-fixes", "frontend-features"]
+prompt = '''
+You are working on work item {{work_item_number}} in the Do Good Arching repository.
+This step delivers section 14 (fill in the `aspec/` folder) and the README updates
+from sections 2, 12 and 13. Read first: `/awman/context/workflow/harness-notes.md`,
+`/awman/context/workflow/backend-api-changes.md`,
+`/awman/context/workflow/module-layout.md`,
+`/awman/context/workflow/frontend-layout.md`,
+`/awman/context/workflow/frontend-changes.md`, then `README.md`, `REVIEW.md`,
+`wrangler.toml`, the CI workflows, `src/db/schema.ts` and the code. The code is the
+source of truth; describe the project as it now is, and where work item 0002 will
+change something, describe current behaviour and add a `Planned (work item 0002):`
+note (read `aspec/work-items/0002-security-hardening.md` for what that covers).
+
+DO:
+- Fill in every file under `aspec/` except `aspec/devops/subagents.md` and
+  `aspec/work-items/`, following the per-file instructions in section 14 exactly:
+  `foundation.md`, `architecture/design.md` (with a real mermaid diagram that
+  renders on GitHub), `architecture/apis.md`, `architecture/security.md`,
+  `devops/infrastructure.md`, `devops/operations.md`, `devops/cicd.md`,
+  `devops/localdev.md`, `uxui/experience.md`, `uxui/interface.md`,
+  `uxui/setup.md`, and `uxui/cli.md` and `genai/agents.md` as `Not applicable:` with
+  the reason. Keep each file's heading structure; add or remove numbered sections
+  (Persona N, Component N, Principle N) to fit. Each fact lives in one place and
+  other files link to it (for example `security.md` refers to `foundation.md` for
+  the RBAC table). Replace every placeholder: `projectname`, `[a | b]` choices,
+  `- guidance`, `- description`, `- details`, the example mermaid diagram.
+- README: update the roles table and the "First run" section for the owner, coach
+  invites and the shared team; document `npm test`, `npm run lint`, the preview
+  environment and the deploy workflows; update "Verification status" with what is
+  now covered (read the test files under `test/` and `frontend/src/**/*.test.*`
+  that exist at the time you write; other agents are still adding tests, so
+  describe the harness and the areas covered rather than exact counts). Keep the
+  placeholder `database_id` callout. The README stays the user-facing quick start;
+  `aspec/` is the design reference; link each to the other.
+- Take facts only from the code, README, wrangler.toml, REVIEW.md and the Decisions
+  list in the work item. Do not invent requirements. If you hit a decision that is
+  not covered, describe the current behaviour and append the question to
+  `/awman/context/workflow/open-questions.md` for the product owner; do not leave
+  open-question lists inside `aspec/`.
+
+DO NOT:
+- Do not edit any code, tests, config or `.awman/`. Do not edit
+  `aspec/devops/subagents.md` or any work item file.
+
+Success criteria:
+- The grep from the work item's Test Considerations
+  (`grep -rnE 'projectname|- guidance|- description|- details|\[[a-z]+ [|]' aspec --include=*.md --exclude-dir=work-items`)
+  returns no matches.
+- Personas/RBAC, the component list, the API conventions (status codes 400, 401, 403,
+  404, 409, 410, 413, 415, 429, 500; `{ error: string }`), the module layout and the
+  migration procedure match the code and scripts as they exist now.
+- The mermaid diagram parses (check it with a mermaid CLI if available, otherwise
+  validate the syntax carefully by hand).
+
+Before finishing, write `/awman/context/workflow/docs-notes.md`: which files you wrote,
+which facts you were unsure about and how you resolved them, and the spot-checks a
+reviewer should perform.
+
+Work item (full text; also at aspec/work-items/0001-architecture-remediation.md):
+{{work_item_content}}
+'''
+
+[[step]]
+name = "review-backend"
+agent = "codex"
+depends_on = ["tests-auth-team", "tests-tracker"]
+prompt = '''
+You are the independent, adversarial reviewer for the backend of work item
+{{work_item_number}} in the Do Good Arching repository. Other agents implemented and
+tested it; your job is to find what they got wrong. You do NOT fix anything: you
+produce findings that a separate remediation step will act on.
+
+Read first: `/awman/context/workflow/backend-api-changes.md`,
+`/awman/context/workflow/module-layout.md`,
+`/awman/context/workflow/tests-auth-team-coverage.md`,
+`/awman/context/workflow/tests-tracker-coverage.md` and, if present,
+`/awman/context/workflow/test-findings.md`. Then review `git diff main...HEAD`
+(or the full working tree if there is no base) for `src/`, `migrations/`,
+`drizzle.config.ts`, `wrangler.toml`, `package.json`, the ESLint and vitest
+configs, `.github/workflows/` and `test/`.
+
+Check, at minimum, every item in the work item's Implementation Details sections
+1 to 8, 10, 11 and 13, and every bullet of its Edge Case Considerations and Test
+Considerations that concerns the backend, CI or migrations. Specifically verify:
+- no `transaction(` anywhere in `src/`, the lint rule forbids it, and bootstrap and
+  accept-invite are each a single statement or a single `batch` with the exact
+  guards and status mapping from section 1 (409 / 410, invite not consumed on a
+  username clash, coach invite rejected when the creator is no longer owner);
+- the 0002 migration: FKs with ON DELETE CASCADE, `invited_by` ON DELETE SET NULL,
+  partial unique owner index, orphan-row handling, `entries` dropped, the
+  program-state backfill anchor really matches `datedProgramState`, clean migration
+  of an empty DB and of a single-coach DB; `npm run db:check` passes;
+- team-model access rules (any coach reaches any athlete, never another coach's
+  account, private logs never reachable by coaches, attachment download rules,
+  owner-only coach invites, invite listing/revoking visibility);
+- `getTrackerPayload` uses SQL aggregation and `inArray`, pagination order is
+  deterministic on `(session_date, id)`, auth middleware is one joined query;
+- 404 on no-match for every listed mutation; atomic score insert without `max(id)`;
+  `sort_order` computed in the insert; maintenance clear is one statement/batch;
+- the default program-state constant is cycle 1 / week 1 / poundage unset and used
+  everywhere; the starter plan is generic; import tolerates `entries`;
+- Content-Disposition builder correctness for non-ASCII and quotes;
+- response shapes unchanged except as the work item allows; `frontend/src/api.ts`
+  still matches the backend;
+- CI/CD: ci.yml runs typecheck, lint, db:check, test, build; preview deploy runs
+  migrations before deploying; production is workflow_dispatch with an approval
+  environment and a SHA input; the version message/tag carries the git SHA;
+- tests: every Test Considerations bullet for the backend has a real test that
+  would fail if the behaviour regressed (look for tautological or skipped tests).
+
+Run `npm run typecheck`, `npm run lint`, `npm run db:check` and `npm test` yourself
+and include the results.
+
+Write `/awman/context/workflow/review-backend-findings.md`. For each finding give a
+severity (blocker / major / minor / nit), the file and line, what is wrong, how to
+reproduce or which test would expose it, and the concrete fix you expect. Also list
+what you verified as correct so the remediation step does not re-check it. End
+with a verdict line: `VERDICT: ready` or `VERDICT: needs-remediation`. Do not
+modify any file outside `/awman/context/workflow/`.
+
+Work item (full text; also at aspec/work-items/0001-architecture-remediation.md):
+{{work_item_content}}
+'''
+
+[[step]]
+name = "review-frontend-docs"
+agent = "codex"
+depends_on = ["tests-tracker", "aspec-docs"]
+prompt = '''
+You are the independent, adversarial reviewer for the frontend and documentation of
+work item {{work_item_number}} in the Do Good Arching repository. Other agents
+implemented and tested it; your job is to find what they got wrong. You do NOT fix
+anything: you produce findings that a separate remediation step will act on.
+
+Read first: `/awman/context/workflow/frontend-layout.md`,
+`/awman/context/workflow/frontend-changes.md`,
+`/awman/context/workflow/backend-api-changes.md`,
+`/awman/context/workflow/docs-notes.md`,
+`/awman/context/workflow/tests-tracker-coverage.md` and, if present,
+`/awman/context/workflow/open-questions.md`. Then review the diff for `frontend/`,
+`README.md`, `.gitignore` and `aspec/` (excluding `aspec/work-items/` and
+`aspec/devops/subagents.md`).
+
+Frontend: verify sections 4 (frontend split), 5 (cursor use), 6 (404 handling,
+including double-click deletes and optimistic updates), 8 (starter plan label,
+poundage prompt when unset, SPT images and UI removed), 9 (`safeHttpUrl` rules:
+relative URLs, absolute same-origin, cross-origin http/https, malformed and
+javascript: values; no `target="_blank"` + `noopener` for same-origin file links;
+the "Open" link renders for uploaded files), 12 (service-worker cache name carries
+a build hash, `activate` deletes `dga-shell-v1` and other old caches, API stays
+network-only) and 13 (Team tab lists all athletes, owner sees "Invite coach" and
+the coach list, invite list/revoke visibility, no "my team" wording, no `coachId`).
+Confirm `frontend/src/api.ts` matches the backend routes and response shapes, and
+that the frontend unit tests are real (not tautological).
+
+Docs: run the grep from the work item's Test Considerations over `aspec/` and
+confirm it returns nothing. Spot-check against the code at least: personas and
+RBAC in `foundation.md`, the component list and data model in `design.md`, the API
+conventions and status codes in `apis.md`, the migration procedure and runbook in
+`operations.md`, the CI/CD description in `cicd.md`, and the README roles table,
+first-run section and verification status. Confirm each fact lives in one place,
+that 0002 items are labelled `Planned (work item 0002):` rather than documented as
+done, that no open-question lists remain in `aspec/`, that `subagents.md` and
+`.awman/` are untouched, and that the mermaid diagram is valid.
+
+Run `npm run typecheck`, `npm run lint`, `npm run test:frontend` and `npm run build`
+yourself and include the results.
+
+Write `/awman/context/workflow/review-frontend-docs-findings.md`. For each finding give
+a severity (blocker / major / minor / nit), the file and line, what is wrong, how to
+reproduce, and the concrete fix you expect. Also list what you verified as correct.
+End with a verdict line: `VERDICT: ready` or `VERDICT: needs-remediation`. Do not
+modify any file outside `/awman/context/workflow/`.
+
+Work item (full text; also at aspec/work-items/0001-architecture-remediation.md):
+{{work_item_content}}
+'''
+
+[[step]]
+name = "remediate"
+agent = "claude"
+depends_on = ["review-backend", "review-frontend-docs"]
+prompt = '''
+You are remediating the review findings for work item {{work_item_number}} in the Do
+Good Arching repository. Read `/awman/context/workflow/review-backend-findings.md`,
+`/awman/context/workflow/review-frontend-docs-findings.md` and, if present,
+`/awman/context/workflow/test-findings.md` and
+`/awman/context/workflow/open-questions.md`. The other handoff notes in
+`/awman/context/workflow/` describe the module layout and API changes.
+
+DO:
+- Fix every blocker and major finding, and every real bug recorded in
+  `test-findings.md` (keep the failing tests; make them pass by fixing the code, not
+  the test). Fix minor findings and nits when the fix is local and safe; otherwise
+  list them as deferred with a reason.
+- If a finding contradicts the work item, the work item wins; say so in your notes.
+- When a fix changes behaviour that `aspec/` or the README documents, update the
+  matching document in the same change so the aspec stays accurate.
+- Keep the constraints of the item: no `transaction(`, response shapes unchanged
+  except as allowed, no 0002 work, `.awman/` and `aspec/devops/subagents.md`
+  untouched.
+
+Success criteria: `npm run typecheck`, `npm run lint`, `npm run db:check`, `npm test`
+and `npm run build` all pass, and the aspec grep from the Test Considerations
+returns nothing.
+
+Before finishing, write `/awman/context/workflow/remediation-notes.md`: each finding
+with its outcome (fixed / deferred with reason / rejected with reason and the
+work-item text that justifies it) and the commands you ran with their results.
+
+Work item (full text; also at aspec/work-items/0001-architecture-remediation.md):
+{{work_item_content}}
+'''
+
+[[step]]
+name = "verify-remediation"
+agent = "codex"
+depends_on = ["remediate"]
+abort_on_failure = true
+prompt = '''
+You are the final gate for work item {{work_item_number}} in the Do Good Arching
+repository. Read `/awman/context/workflow/review-backend-findings.md`,
+`/awman/context/workflow/review-frontend-docs-findings.md` and
+`/awman/context/workflow/remediation-notes.md`.
+
+Verify that every blocker and major finding was actually fixed in the code (read the
+code, do not trust the notes), that deferred or rejected findings have a sound
+reason, and that no fix introduced a regression. Run `npm run typecheck`,
+`npm run lint`, `npm run db:check`, `npm test` and `npm run build`, and the aspec
+placeholder grep from the work item's Test Considerations.
+
+Write `/awman/context/workflow/final-verdict.md` with the results and a
+`VERDICT: ready` or `VERDICT: not-ready` line. If everything passes and no blocker
+or major finding remains open, finish successfully. If a blocker or major finding
+remains open or any command fails, you may fix it yourself when the fix is small
+and unambiguous (record what you changed); otherwise exit with a non-zero status so
+the workflow stops for a human.
+
+Work item summary and edge cases, for reference:
+{{work_item_content}}
+'''
+
+# ── Teardown ──────────────────────────────────────────────────────────────────
+
+[[teardown]]
+type = "run_shell"
+command = "npm run typecheck && npm run lint && npm run db:check && npm test && npm run build"
+abort_on_failure = true
+
+[teardown.on_failure]
+prompt = "The final verification for work item 0001 failed (typecheck, lint, drizzle-kit no-diff check, vitest suite, or build). Read the failing output, fix the root cause in the code without weakening or skipping tests, and make `npm run typecheck && npm run lint && npm run db:check && npm test && npm run build` pass. Do not touch .awman/ or aspec/devops/subagents.md."
+agent = "claude"
+max_attempts = 2
+
+[[teardown]]
+type = "commit_changes"
+message = "Architecture remediation from the 2026-09-26 review (work item {{work_item_number}})"
+add_all = true
+
+[[teardown]]
+type = "push_branch"
+overlays = ["ssh()"]
+
+[[teardown]]
+type = "create_pull_request"
+title = "Work item {{work_item_number}}: architecture remediation"
+body = "Implements work item {{work_item_number}}: D1 batch writes (C1), test harness + CI/CD + lint, drizzle-kit schema source of truth and FK migration, module restructure, tracker fixes, shared coaching team with owner role, frontend fixes, and the filled-in aspec/. See aspec/work-items/{{work_item_number}}-architecture-remediation.md."
+overlays = ["env(GITHUB_TOKEN)"]

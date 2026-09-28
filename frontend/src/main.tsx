@@ -11,7 +11,8 @@ const queryClient = new QueryClient({
 });
 
 // Offline app shell is a nice-to-have; only register the service worker in
-// production builds. `/api/*` is never cached (see public/sw.js).
+// production builds. `/api/*` is never cached (see frontend/sw.js, emitted
+// with a per-build cache name by the plugin in vite.config.ts).
 function registerServiceWorker() {
   if (import.meta.env.PROD && "serviceWorker" in navigator) {
     window.addEventListener("load", () => {

@@ -127,7 +127,8 @@ export interface MaintenanceItem {
 }
 
 export interface TrackerPayload {
-  state: { currentPoundage: number; currentCycle: number; currentWeek: number };
+  /** `currentPoundage` is null until the athlete sets it (see `api.savePoundage`). */
+  state: { currentPoundage: number | null; currentCycle: number; currentWeek: number };
   weeklyPlans: CycleWeekPlan[];
   plannedSessions: PlannedSession[];
   sessions: TrainingSession[];
@@ -144,16 +145,35 @@ export interface TrackerPayload {
   recipes: Recipe[];
 }
 
+/** The public user shape returned by bootstrap, login, accept-invite and `/api/auth/me`. */
 export interface Me {
   id: string;
   username: string;
   role: Role;
-  coachId: string | null;
+  /** The first (bootstrap) coach. Only the owner can invite coaches and list them. */
+  isOwner: boolean;
+}
+
+/** Invite as listed by `GET /api/auth/invites`; instants are epoch milliseconds. */
+export interface Invite {
+  id: string;
+  role: Role;
+  createdBy: string | null;
+  expiresAt: number;
+  usedAt: number | null;
+  createdAt: number;
 }
 
 export interface AthleteSummary {
   id: string;
   username: string;
+  createdAt: string;
+}
+
+export interface CoachSummary {
+  id: string;
+  username: string;
+  isOwner: boolean;
   createdAt: string;
 }
 
@@ -229,19 +249,30 @@ export function fileToBase64(file: File): Promise<{ mimeType: string; dataBase64
 export const api = {
   // ---- auth ----
   authStatus: () => get<{ setupRequired: boolean }>("/api/auth/status"),
-  bootstrap: (args: { username: string; password: string }) =>
-    post<{ id: string; username: string; role: Role }>("/api/auth/bootstrap", args),
+  bootstrap: (args: { username: string; password: string }) => post<Me>("/api/auth/bootstrap", args),
   login: (args: { username: string; password: string }) => post<Me>("/api/auth/login", args),
   logout: () => post<{ ok: true }>("/api/auth/logout"),
   me: () => get<Me>("/api/auth/me"),
-  createInvite: () =>
-    post<{ token: string; invitePath: string; expiresInHours: number }>("/api/auth/invites", {}),
+  // Any coach may create athlete invites; only the owner may create coach invites (403 otherwise).
+  createInvite: (args: { role: Role } = { role: "athlete" }) =>
+    post<{ token: string; invitePath: string; expiresInHours: number }>("/api/auth/invites", args),
+  // The owner sees every invite; other coaches see (and can revoke) only their own.
+  listInvites: () => get<Invite[]>("/api/auth/invites"),
+  revokeInvite: (args: { id: string }) => del<{ ok: true }>(`/api/auth/invites/${encodeURIComponent(args.id)}`),
   acceptInvite: (args: { token: string; username: string; password: string }) =>
-    post<{ id: string; username: string; role: Role }>("/api/auth/accept-invite", args),
+    post<Me>("/api/auth/accept-invite", args),
 
   // ---- personal tracker (own data) ----
-  getTracker: (args: { today: string }) =>
-    get<TrackerPayload>(`/api/tracker?today=${encodeURIComponent(args.today)}`),
+  // `before` is the exclusive "${sessionDate},${id}" cursor of the last session
+  // already shown; it pages only `sessions` (100 per page, newest first).
+  getTracker: (args: { today: string; before?: string }) => {
+    const query = new URLSearchParams({ today: args.today });
+    if (args.before) query.set("before", args.before);
+    return get<TrackerPayload>(`/api/tracker?${query.toString()}`);
+  },
+  /** Cursor for loading sessions older than `session` (see `getTracker`). */
+  sessionCursor: (session: Pick<TrainingSession, "sessionDate" | "id">) => `${session.sessionDate},${session.id}`,
+  savePoundage: (args: { poundage: number; today: DateStr }) => post<{ currentPoundage: number }>("/api/plan/poundage", args),
   saveWeeklyNote: (args: { today: string; notes: string }) => post<WeeklyNote>("/api/notes/weekly", args),
   addSession: (args: SessionInput) => post<{ id: number }>("/api/sessions", args),
   updateSession: (args: { id: number } & SessionInput) =>
@@ -251,7 +282,7 @@ export const api = {
     post<{ id: number; total: number; averageArrow: number }>("/api/scores", args),
   deletePracticeScore: (args: { id: number }) => del<{ ok: true }>(`/api/scores/${args.id}`),
   savePlannedSession: (args: { dayKey: PlanDayKey; sessionType: string; detail: string; prescription: string }) =>
-    post<PlannedSession>("/api/plan/sessions", args),
+    post<PlannedSessionWrite>("/api/plan/sessions", args),
   addPlannedSessionLink: (args: { dayKey: PlanDayKey; label: string; url: string }) =>
     post<{ id: number }>("/api/plan/sessions/links", args),
   addPlannedSessionFile: (args: {
@@ -299,6 +330,7 @@ export const api = {
 
   // ---- coach (athlete's plans/summaries only; never private log rows) ----
   listAthletes: () => get<{ athletes: AthleteSummary[] }>("/api/coach/athletes"),
+  listCoaches: () => get<{ coaches: CoachSummary[] }>("/api/coach/coaches"), // owner only (403 otherwise)
   athleteOverview: (athleteId: string, today: string) =>
     get<CoachAthleteOverview>(
       `/api/coach/athletes/${encodeURIComponent(athleteId)}/overview?today=${encodeURIComponent(today)}`,
@@ -306,7 +338,7 @@ export const api = {
   coachSavePlannedSession: (
     athleteId: string,
     args: { dayKey: PlanDayKey; sessionType: string; detail: string; prescription: string },
-  ) => put<PlannedSession>(`/api/coach/athletes/${encodeURIComponent(athleteId)}/plan/sessions`, args),
+  ) => put<PlannedSessionWrite>(`/api/coach/athletes/${encodeURIComponent(athleteId)}/plan/sessions`, args),
   coachAddPlannedSessionLink: (athleteId: string, args: { dayKey: PlanDayKey; label: string; url: string }) =>
     post<{ id: number }>(`/api/coach/athletes/${encodeURIComponent(athleteId)}/plan/sessions/links`, args),
   coachAddPlannedSessionFile: (
@@ -343,3 +375,6 @@ export const api = {
   importData: (payload: ExportPayload) =>
     post<{ ok: true; counts: Record<string, number> }>("/api/import", payload),
 };
+
+/** Plan mutations return only persisted fields; read-only labels/attachments are in tracker reads. */
+export type PlannedSessionWrite = Pick<PlannedSession, "dayKey" | "sessionType" | "detail" | "prescription"> & { updatedAt: string };

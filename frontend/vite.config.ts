@@ -1,6 +1,7 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
+import { serviceWorkerCache } from "../scripts/service-worker-cache.mjs";
 
 // Directory containing this config file (works without node types).
 const root = decodeURIComponent(new URL(".", import.meta.url).pathname);
@@ -10,7 +11,7 @@ const root = decodeURIComponent(new URL(".", import.meta.url).pathname);
 // `../dist/client` (repo: `do-good-arching/dist/client`) for the Worker to serve.
 export default defineConfig({
   root,
-  plugins: [react(), tailwindcss()],
+  plugins: [react(), tailwindcss(), serviceWorkerCache()],
   build: {
     outDir: "../dist/client",
     emptyOutDir: true,

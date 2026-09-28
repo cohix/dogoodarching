@@ -1,0 +1,52 @@
+# Continuous integration: runs on every push and pull request.
+# Typecheck, lint, schema no-diff check, tests (Worker + frontend), then build.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Typecheck, lint, test, build
+    runs-on: ubuntu-latest
+    env:
+      WRANGLER_SEND_METRICS: "false"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Documentation placeholders
+        run: npm run docs:check
+
+      # drizzle-kit must produce no new migration: schema.ts and migrations/ agree.
+      - name: Schema drift check
+        run: npm run db:check
+
+      # Worker tests run inside workerd (local D1/R2, no Cloudflare login);
+      # frontend tests run under jsdom.
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build

@@ -1,6 +1,7 @@
-import { eq, lt } from "drizzle-orm";
+import { sql } from "drizzle-orm";
 import type { Context } from "hono";
-import { getDb, schema, type Db } from "../db";
+import { createMiddleware } from "hono/factory";
+import { getDb, type Db } from "../db";
 import type { AppBindings } from "./rbac";
 
 /** Best-effort client IP for rate-limit keys (Cloudflare-aware). */
@@ -18,7 +19,7 @@ export function clientIp(c: Context<AppBindings>): string {
 /**
  * Fixed-window rate limiter backed by D1. Returns true when the attempt is
  * allowed (and records it), false when the caller has exceeded maxAttempts
- * within windowMs. Stale buckets are cleaned up opportunistically.
+ * within windowMs. Each key resets only when its own window expires.
  */
 export async function checkRateLimit(
   db: Db,
@@ -27,26 +28,32 @@ export async function checkRateLimit(
   windowMs: number,
 ): Promise<boolean> {
   const now = Date.now();
-  await db.delete(schema.rateLimits).where(lt(schema.rateLimits.windowStart, now - windowMs));
-  const rows = await db.select().from(schema.rateLimits).where(eq(schema.rateLimits.key, key)).limit(1);
-  const row = rows[0];
-  if (!row) {
-    await db.insert(schema.rateLimits).values({ key, attempts: 1, windowStart: now });
-    return true;
-  }
-  if (row.attempts >= maxAttempts) return false;
-  await db.update(schema.rateLimits).set({ attempts: row.attempts + 1 }).where(eq(schema.rateLimits.key, key));
-  return true;
+  // The conditional upsert admits at most maxAttempts callers, including on
+  // the first request and at window rollover. A blocked attempt returns no row.
+  const rows = await db.all(sql`
+    INSERT INTO rate_limits (key, attempts, window_start) VALUES (${key}, 1, ${now})
+    ON CONFLICT(key) DO UPDATE SET
+      attempts = CASE WHEN window_start <= ${now - windowMs} THEN 1 ELSE attempts + 1 END,
+      window_start = CASE WHEN window_start <= ${now - windowMs} THEN ${now} ELSE window_start END
+    WHERE window_start <= ${now - windowMs} OR attempts < ${maxAttempts}
+    RETURNING attempts
+  `);
+  return rows.length === 1;
 }
 
-/** Convenience wrapper: rate-limit the current request or return a 429 response. */
-export async function rateLimitOr429(
-  c: Context<AppBindings>,
-  key: string,
+/**
+ * Middleware: counts the request against `keyFor(c)` and answers 429 once the
+ * window's attempts are used up. Place it before body validation so invalid
+ * requests still count as attempts.
+ */
+export function rateLimit(
+  keyFor: (c: Context<AppBindings>) => string,
   maxAttempts: number,
   windowMs: number,
-): Promise<Response | null> {
-  const allowed = await checkRateLimit(getDb(c.env.DB), key, maxAttempts, windowMs);
-  if (!allowed) return c.json({ error: "Too many attempts. Try again later." }, 429);
-  return null;
+) {
+  return createMiddleware<AppBindings>(async (c, next) => {
+    const allowed = await checkRateLimit(getDb(c.env.DB), keyFor(c), maxAttempts, windowMs);
+    if (!allowed) return c.json({ error: "Too many attempts. Try again later." }, 429);
+    await next();
+  });
 }

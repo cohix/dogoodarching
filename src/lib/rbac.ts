@@ -20,24 +20,23 @@ export const authMiddleware = createMiddleware<AppBindings>(async (c, next) => {
   if (!token) return c.json({ error: "Unauthorized" }, 401);
   const db = getDb(c.env.DB);
   const tokenHash = await sha256Hex(token);
-  const sessionRows = await db
-    .select()
+  const rows = await db
+    .select({ sessionId: schema.sessions.id, user: schema.users })
     .from(schema.sessions)
-    .where(and(eq(schema.sessions.tokenHash, tokenHash), gt(schema.sessions.expiresAt, Date.now())))
+    .innerJoin(schema.users, eq(schema.users.id, schema.sessions.userId))
+    .where(and(eq(schema.sessions.tokenHash, tokenHash), gt(schema.sessions.expiresAt, new Date())))
     .limit(1);
-  const session = sessionRows[0];
-  if (!session) return c.json({ error: "Unauthorized" }, 401);
-  const userRows = await db.select().from(schema.users).where(eq(schema.users.id, session.userId)).limit(1);
-  const user = userRows[0];
-  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const row = rows[0];
+  if (!row) return c.json({ error: "Unauthorized" }, 401);
+  const { user } = row;
   c.set("user", {
     id: user.id,
     username: user.username,
     role: user.role,
-    coachId: user.coachId,
+    isOwner: user.isOwner,
     createdAt: user.createdAt,
   });
-  c.set("sessionId", session.id);
+  c.set("sessionId", row.sessionId);
   await next();
 });
 
@@ -47,13 +46,8 @@ export const requireCoach = createMiddleware<AppBindings>(async (c, next) => {
   await next();
 });
 
-/**
- * Loads an athlete that belongs to the calling coach's team.
- * Returns null (caller should 404) unless the athlete exists AND
- * has role='athlete' AND coach_id = coach.id.
- */
+/** Loads an athlete in the deployment-wide team; coach routes enforce requireCoach. */
 export async function resolveAthlete(c: Context<AppBindings>, athleteId: string): Promise<AuthUser | null> {
-  const coach = c.get("user");
   const db = getDb(c.env.DB);
   const rows = await db
     .select()
@@ -62,7 +56,6 @@ export async function resolveAthlete(c: Context<AppBindings>, athleteId: string)
       and(
         eq(schema.users.id, athleteId),
         eq(schema.users.role, "athlete"),
-        eq(schema.users.coachId, coach.id),
       ),
     )
     .limit(1);
@@ -72,7 +65,7 @@ export async function resolveAthlete(c: Context<AppBindings>, athleteId: string)
     id: athlete.id,
     username: athlete.username,
     role: athlete.role,
-    coachId: athlete.coachId,
+    isOwner: athlete.isOwner,
     createdAt: athlete.createdAt,
   };
 }

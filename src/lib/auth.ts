@@ -9,7 +9,7 @@ export interface AuthUser {
   id: string;
   username: string;
   role: "coach" | "athlete";
-  coachId: string | null;
+  isOwner: boolean;
   createdAt: Date;
 }
 

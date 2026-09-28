@@ -1,88 +1,22 @@
-// Export / import for the caller's own account (both roles).
+// Export / import of one account's data (both roles).
 //
-// Export downloads dga-export-YYYYMMDD.json. LIMITATION: file attachments
+// Export produces the version-1 JSON document. LIMITATION: file attachments
 // (kind "document" | "photo") are EXCLUDED from the export — their blob bytes
 // live in R2 and are not serialized; only link attachments are included.
 // Import replaces ALL of the caller's data in a single D1 batch, remapping
 // ids, and never touches other users' rows.
 
-import { Hono } from "hono";
 import { and, asc, eq, max, ne } from "drizzle-orm";
 import type { BatchItem } from "drizzle-orm/batch";
-import { z } from "zod";
-import { getDb, schema, type Db } from "../db";
-import { authMiddleware, type AppBindings } from "../lib/rbac";
-import { readJsonBody, zodErrorMessage, sessionType, planDayKey, attachmentKind, maintenanceSection } from "./tracker";
+import { schema, type Db } from "../db";
+import type { ImportData } from "../lib/validation";
 
-const transfer = new Hono<AppBindings>();
+export const EXPORT_VERSION = 1 as const;
 
-transfer.use("*", authMiddleware);
-
-const isoDateTime = z.string().refine((s) => !Number.isNaN(Date.parse(s)), { message: "Invalid date" });
-
-const importPayloadSchema = z.object({
-  version: z.literal(1),
-  data: z.object({
-    trainingSessions: z.array(z.object({
-      id: z.number().int(), sessionDate: z.string(), sessionType, customActivity: z.string(),
-      arrows: z.number().int(), durationMinutes: z.number().int(), focus: z.string(), score: z.string(),
-      notes: z.string(), createdAt: isoDateTime,
-    })),
-    practiceScores: z.array(z.object({
-      id: z.number().int(), scoreDate: z.string(), total: z.number().int(), createdAt: isoDateTime,
-    })),
-    practiceScoreEnds: z.array(z.object({
-      id: z.number().int(), scoreId: z.number().int(), endNumber: z.number().int(), arrow1: z.number().int(),
-      arrow2: z.number().int(), arrow3: z.number().int(), endTotal: z.number().int(),
-    })),
-    programState: z.object({
-      currentPoundage: z.number().int(), currentCycle: z.number().int(), currentWeek: z.number().int(),
-      updatedAt: isoDateTime,
-    }).nullable(),
-    cycleWeekPlans: z.array(z.object({
-      weekNumber: z.number().int(), primaryFocus: z.string(), backgroundFocusOne: z.string(),
-      backgroundFocusTwo: z.string(), updatedAt: isoDateTime,
-    })),
-    plannedSessionOverrides: z.array(z.object({
-      dayKey: planDayKey, sessionType: z.string(), detail: z.string(), prescription: z.string(),
-      updatedAt: isoDateTime,
-    })),
-    plannedSessionAttachments: z.array(z.object({
-      id: z.number().int(), dayKey: planDayKey, kind: attachmentKind,
-      label: z.string(), url: z.string(), mimeType: z.string(), createdAt: isoDateTime,
-    })),
-    milestoneChecks: z.array(z.object({ key: z.string(), checked: z.boolean(), updatedAt: isoDateTime })),
-    maintenanceChecks: z.array(z.object({ key: z.string(), checked: z.boolean(), updatedAt: isoDateTime })),
-    maintenanceItems: z.array(z.object({
-      id: z.number().int(), section: maintenanceSection, label: z.string(),
-      sortOrder: z.number().int(), createdAt: isoDateTime, updatedAt: isoDateTime,
-    })),
-    inspirationEntries: z.array(z.object({
-      id: z.number().int(), thoughtText: z.string(), videoTitle: z.string(), videoUrl: z.string(),
-      recipeName: z.string(), recipeSummary: z.string(), recipeIngredients: z.string(),
-      recipeInstructions: z.string(), updatedAt: isoDateTime,
-    })),
-    weeklyNotes: z.array(z.object({
-      id: z.number().int(), weekStart: z.string(), notes: z.string(),
-      createdAt: isoDateTime, updatedAt: isoDateTime,
-    })),
-    bowSetups: z.array(z.object({
-      id: z.number().int(), poundage: z.number().int(), name: z.string(), limbRiser: z.string(),
-      tillerBolts: z.string(), braceHeight: z.string(), stringTwists: z.string(), nockingPoint: z.string(),
-      centerShot: z.string(), plunger: z.string(), gripNotes: z.string(), stabilizer: z.string(),
-      clickerPosition: z.string(), bareShaft: z.string(), walkBack: z.string(), arrowsInUse: z.string(),
-      sightMarksJson: z.string(), updatedAt: isoDateTime,
-    })),
-    entries: z.array(z.object({ id: z.number().int(), text: z.string(), createdAt: isoDateTime })),
-  }),
-});
-
-transfer.get("/export", async (c) => {
-  const db = getDb(c.env.DB);
-  const userId = c.get("user").id;
+export async function exportUserData(db: Db, userId: string, username: string) {
   const [
     sessionRows, scoreRows, endRows, stateRows, weekPlanRows, overrideRows, attachmentRows,
-    milestoneRows, maintenanceRows, itemRows, inspirationRows, noteRows, setupRows, entryRows,
+    milestoneRows, maintenanceRows, itemRows, inspirationRows, noteRows, setupRows,
   ] = await Promise.all([
     db.select().from(schema.trainingSessions).where(eq(schema.trainingSessions.userId, userId)).orderBy(asc(schema.trainingSessions.id)),
     db.select().from(schema.practiceScores).where(eq(schema.practiceScores.userId, userId)).orderBy(asc(schema.practiceScores.id)),
@@ -97,14 +31,13 @@ transfer.get("/export", async (c) => {
     db.select().from(schema.inspirationEntries).where(eq(schema.inspirationEntries.userId, userId)).orderBy(asc(schema.inspirationEntries.id)),
     db.select().from(schema.weeklyNotes).where(eq(schema.weeklyNotes.userId, userId)).orderBy(asc(schema.weeklyNotes.id)),
     db.select().from(schema.bowSetups).where(eq(schema.bowSetups.userId, userId)).orderBy(asc(schema.bowSetups.id)),
-    db.select().from(schema.entries).where(eq(schema.entries.userId, userId)).orderBy(asc(schema.entries.id)),
   ]);
   const iso = (d: Date) => d.toISOString();
   const state = stateRows[0];
-  const payload = {
-    version: 1 as const,
+  return {
+    version: EXPORT_VERSION,
     exportedAt: new Date().toISOString(),
-    username: c.get("user").username,
+    username,
     data: {
       trainingSessions: sessionRows.map((r) => ({
         id: r.id, sessionDate: r.sessionDate, sessionType: r.sessionType, customActivity: r.customActivity,
@@ -154,35 +87,36 @@ transfer.get("/export", async (c) => {
         arrowsInUse: r.arrowsInUse, sightMarksJson: r.sightMarksJson,
         updatedAt: iso(r.updatedAt),
       })),
-      entries: entryRows.map((r) => ({ id: r.id, text: r.text, createdAt: iso(r.createdAt) })),
     },
   };
-  const filename = `dga-export-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}.json`;
-  return new Response(JSON.stringify(payload), {
-    headers: {
-      "Content-Type": "application/json",
-      "Content-Disposition": `attachment; filename="${filename}"`,
-    },
-  });
-});
+}
 
-function chunk<T>(rows: T[], size: number): T[][] {
-  const out: T[][] = [];
-  for (let i = 0; i < rows.length; i += size) out.push(rows.slice(i, i + size));
+/** Download filename for an export taken today. */
+export function exportFilename(now: Date = new Date()): string {
+  return `dga-export-${now.toISOString().slice(0, 10).replace(/-/g, "")}.json`;
+}
+
+// D1 limits each statement to 100 bind parameters, not 100 rows. Count the
+// generated parameters, including remapped IDs and defaults, before batching.
+function insertChunks<T>(rows: T[], insert: (rows: T[]) => BatchItem<"sqlite"> & { toSQL(): { params: unknown[] } }): BatchItem<"sqlite">[] {
+  const out: BatchItem<"sqlite">[] = [];
+  for (let offset = 0; offset < rows.length;) {
+    let size = Math.min(100, rows.length - offset);
+    let statement = insert(rows.slice(offset, offset + size));
+    while (statement.toSQL().params.length > 100) {
+      if (size === 1) throw new Error("An import row exceeds D1's bind limit");
+      size = Math.floor(size / 2);
+      statement = insert(rows.slice(offset, offset + size));
+    }
+    out.push(statement);
+    offset += size;
+  }
   return out;
 }
 
-transfer.post("/import", async (c) => {
-  let body: unknown;
-  try { body = await readJsonBody(c); } catch { return c.json({ error: "Invalid JSON body" }, 400); }
-  const parsed = importPayloadSchema.safeParse(body);
-  if (!parsed.success) return c.json({ error: zodErrorMessage(parsed.error) }, 400);
-  const db = getDb(c.env.DB);
-  const userId = c.get("user").id;
-  const data = parsed.data.data;
-
+export async function importUserData(db: Db, bucket: R2Bucket, userId: string, data: ImportData) {
   // Global high-water marks so remapped ids cannot collide with other users' rows.
-  const [mSessions, mScores, mEnds, mNotes, mItems, mSetups, mInspiration, mEntries, mAttachments] = await Promise.all([
+  const [mSessions, mScores, mEnds, mNotes, mItems, mSetups, mInspiration, mAttachments] = await Promise.all([
     db.select({ m: max(schema.trainingSessions.id) }).from(schema.trainingSessions),
     db.select({ m: max(schema.practiceScores.id) }).from(schema.practiceScores),
     db.select({ m: max(schema.practiceScoreEnds.id) }).from(schema.practiceScoreEnds),
@@ -190,7 +124,6 @@ transfer.post("/import", async (c) => {
     db.select({ m: max(schema.maintenanceItems.id) }).from(schema.maintenanceItems),
     db.select({ m: max(schema.bowSetups.id) }).from(schema.bowSetups),
     db.select({ m: max(schema.inspirationEntries.id) }).from(schema.inspirationEntries),
-    db.select({ m: max(schema.entries.id) }).from(schema.entries),
     db.select({ m: max(schema.plannedSessionAttachments.id) }).from(schema.plannedSessionAttachments),
   ]);
   const counters: Record<string, number> = {
@@ -201,7 +134,6 @@ transfer.post("/import", async (c) => {
     maintenanceItems: mItems[0]?.m ?? 0,
     bowSetups: mSetups[0]?.m ?? 0,
     inspirationEntries: mInspiration[0]?.m ?? 0,
-    entries: mEntries[0]?.m ?? 0,
     plannedSessionAttachments: mAttachments[0]?.m ?? 0,
   };
   const idMaps: Record<string, Map<number, number>> = {};
@@ -306,11 +238,6 @@ transfer.post("/import", async (c) => {
       updatedAt: new Date(r.updatedAt),
     };
   });
-  const newEntries = data.entries.map((r) => {
-    const id = nextId("entries");
-    recordId("entries", r.id, id);
-    return { id, userId, text: r.text, createdAt: new Date(r.createdAt) };
-  });
 
   // Import replaces the caller's plan attachments (only link attachments are
   // ever imported), so delete the R2 blobs of their existing file attachments
@@ -325,7 +252,7 @@ transfer.post("/import", async (c) => {
         ne(schema.plannedSessionAttachments.blobKey, ""),
       ),
     );
-  await Promise.all(orphanBlobs.map((r) => c.env.ATTACHMENTS.delete(r.blobKey)));
+  await Promise.all(orphanBlobs.map((r) => bucket.delete(r.blobKey)));
 
   // One D1 batch: delete everything the caller owns (children first), then
   // re-insert the imported rows with remapped ids. Other users' rows are
@@ -343,29 +270,27 @@ transfer.post("/import", async (c) => {
     db.delete(schema.inspirationEntries).where(eq(schema.inspirationEntries.userId, userId)),
     db.delete(schema.weeklyNotes).where(eq(schema.weeklyNotes.userId, userId)),
     db.delete(schema.bowSetups).where(eq(schema.bowSetups.userId, userId)),
-    db.delete(schema.entries).where(eq(schema.entries.userId, userId)),
     db.delete(schema.programState).where(eq(schema.programState.userId, userId)),
-    ...chunk(newTrainingSessions, 100).map((rows) => db.insert(schema.trainingSessions).values(rows)),
-    ...chunk(newPracticeScores, 100).map((rows) => db.insert(schema.practiceScores).values(rows)),
-    ...chunk(newPracticeScoreEnds, 100).map((rows) => db.insert(schema.practiceScoreEnds).values(rows)),
-    ...chunk(newCycleWeekPlans, 100).map((rows) => db.insert(schema.cycleWeekPlans).values(rows)),
-    ...chunk(newPlannedSessionOverrides, 100).map((rows) => db.insert(schema.plannedSessionOverrides).values(rows)),
-    ...chunk(newPlannedSessionAttachments, 100).map((rows) => db.insert(schema.plannedSessionAttachments).values(rows)),
-    ...chunk(newMilestoneChecks, 100).map((rows) => db.insert(schema.milestoneChecks).values(rows)),
-    ...chunk(newMaintenanceChecks, 100).map((rows) => db.insert(schema.maintenanceChecks).values(rows)),
-    ...chunk(newMaintenanceItems, 100).map((rows) => db.insert(schema.maintenanceItems).values(rows)),
-    ...chunk(newInspirationEntries, 100).map((rows) => db.insert(schema.inspirationEntries).values(rows)),
-    ...chunk(newWeeklyNotes, 100).map((rows) => db.insert(schema.weeklyNotes).values(rows)),
-    ...chunk(newBowSetups, 100).map((rows) => db.insert(schema.bowSetups).values(rows)),
-    ...chunk(newEntries, 100).map((rows) => db.insert(schema.entries).values(rows)),
-    ...chunk(newProgramState, 100).map((rows) => db.insert(schema.programState).values(rows)),
+    ...insertChunks(newTrainingSessions, (rows) => db.insert(schema.trainingSessions).values(rows)),
+    ...insertChunks(newPracticeScores, (rows) => db.insert(schema.practiceScores).values(rows)),
+    ...insertChunks(newPracticeScoreEnds, (rows) => db.insert(schema.practiceScoreEnds).values(rows)),
+    ...insertChunks(newCycleWeekPlans, (rows) => db.insert(schema.cycleWeekPlans).values(rows)),
+    ...insertChunks(newPlannedSessionOverrides, (rows) => db.insert(schema.plannedSessionOverrides).values(rows)),
+    ...insertChunks(newPlannedSessionAttachments, (rows) => db.insert(schema.plannedSessionAttachments).values(rows)),
+    ...insertChunks(newMilestoneChecks, (rows) => db.insert(schema.milestoneChecks).values(rows)),
+    ...insertChunks(newMaintenanceChecks, (rows) => db.insert(schema.maintenanceChecks).values(rows)),
+    ...insertChunks(newMaintenanceItems, (rows) => db.insert(schema.maintenanceItems).values(rows)),
+    ...insertChunks(newInspirationEntries, (rows) => db.insert(schema.inspirationEntries).values(rows)),
+    ...insertChunks(newWeeklyNotes, (rows) => db.insert(schema.weeklyNotes).values(rows)),
+    ...insertChunks(newBowSetups, (rows) => db.insert(schema.bowSetups).values(rows)),
+    ...insertChunks(newProgramState, (rows) => db.insert(schema.programState).values(rows)),
   ];
   if (statements.length > 0) {
-    await (db as Db).batch(statements as [BatchItem<"sqlite">, ...BatchItem<"sqlite">[]]);
+    await db.batch(statements as [BatchItem<"sqlite">, ...BatchItem<"sqlite">[]]);
   }
 
-  return c.json({
-    ok: true,
+  return {
+    ok: true as const,
     counts: {
       trainingSessions: newTrainingSessions.length,
       practiceScores: newPracticeScores.length,
@@ -380,9 +305,6 @@ transfer.post("/import", async (c) => {
       inspirationEntries: newInspirationEntries.length,
       weeklyNotes: newWeeklyNotes.length,
       bowSetups: newBowSetups.length,
-      entries: newEntries.length,
     },
-  });
-});
-
-export default transfer;
+  };
+}

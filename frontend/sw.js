@@ -1,5 +1,11 @@
 // Do Good Arching service worker — app shell caching only.
 //
+// This file is NOT served from `public/`: the `serviceWorkerCache` plugin in
+// vite.config.ts emits it as `dist/client/sw.js` with `__BUILD_HASH__` replaced
+// by a hash of the final HTML, assets, public files and this source. Every deploy that changes the app therefore
+// gets a new cache name, and `activate` below deletes every other cache
+// (including the pre-hash `dga-shell-v1`), so users upgrade cleanly.
+//
 // Rules:
 // - `/api/*` is NEVER cached: every API request goes straight to the network,
 //   because the Worker/D1 backend is always the source of truth.
@@ -8,7 +14,7 @@
 //   online.
 // - Built assets under `/assets/` are runtime-cached cache-first.
 
-const CACHE_NAME = "dga-shell-v1";
+const CACHE_NAME = "dga-shell-__BUILD_HASH__";
 
 const APP_SHELL = [
   "/",
@@ -29,6 +35,8 @@ self.addEventListener("install", (event) => {
   );
 });
 
+// Delete every cache that isn't this build's (older `dga-shell-<hash>` caches
+// and the legacy `dga-shell-v1`), then take control of open clients.
 self.addEventListener("activate", (event) => {
   event.waitUntil(
     caches

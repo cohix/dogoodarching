@@ -25,3 +25,26 @@ database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
 [[r2_buckets]]
 binding = "ATTACHMENTS"
 bucket_name = "do-good-arching-attachments"
+
+# ---------------------------------------------------------------------------
+# Preview environment (`wrangler deploy --env preview`, deployed automatically
+# by CI on every merge to `main`). It has its own Worker, D1 database and R2
+# bucket so preview data never touches production. The top-level config above
+# is production.
+#
+# BEFORE FIRST PREVIEW DEPLOY:
+#   1. npx wrangler d1 create do-good-arching-preview
+#      -> paste the returned database_id below (replacing the placeholder)
+#   2. npx wrangler r2 bucket create do-good-arching-attachments-preview
+#   3. npm run db:migrate:preview
+[env.preview]
+name = "do-good-arching-preview"
+
+[[env.preview.d1_databases]]
+binding = "DB"
+database_name = "do-good-arching-preview"
+database_id = "REPLACE_WITH_YOUR_PREVIEW_D1_DATABASE_ID"
+
+[[env.preview.r2_buckets]]
+binding = "ATTACHMENTS"
+bucket_name = "do-good-arching-attachments-preview"
