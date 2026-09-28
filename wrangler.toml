@@ -37,14 +37,12 @@ bucket_name = "dogoodarching-attachments"
 #      -> paste the returned database_id below (replacing the placeholder)
 #   2. npx wrangler r2 bucket create do-good-arching-attachments-preview
 #   3. npm run db:migrate:preview
-[env.preview]
-name = "do-good-arching-preview"
 
-[[env.preview.d1_databases]]
+[[previews.d1_databases]]
 binding = "DB"
 database_name = "dogoodarching-preview"
 database_id = "208493d9-3055-47e3-8bd7-ad0c970204db"
 
-[[env.preview.r2_buckets]]
+[[previews.r2_buckets]]
 binding = "ATTACHMENTS"
 bucket_name = "dogoodarching-attachments-preview"
