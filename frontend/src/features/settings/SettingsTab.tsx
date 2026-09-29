@@ -72,6 +72,8 @@ export function SettingsTab({ me }: { me: Me }) {
       <p className="mt-0.5 text-xs capitalize text-[var(--dim)]">{me.role}</p>
     </section>
     <AccountControls me={me} />
+    {/* Personal export/import is athlete-only: coaches have no personal training data. */}
+    {me.role === "athlete" && <>
     <section className="card p-4">
       <h2 className="section-title">Export my data</h2>
       <p className="mt-2 text-sm leading-6 text-[var(--dim)]">Download everything as JSON. File attachments (photos/documents) are not included in the export.</p>
@@ -90,6 +92,7 @@ export function SettingsTab({ me }: { me: Me }) {
       </label>
       {importMessage && <p role="status" className="mt-2 text-xs font-semibold text-[var(--dim)]">{importMessage}</p>}
     </section>
+    </>}
     <button type="button" disabled={logout.isPending} onClick={() => logout.mutate()} className="w-full rounded-xl border border-[var(--border)] px-4 py-3 text-sm font-bold text-[var(--dim)] disabled:opacity-50">{logout.isPending ? "Logging out…" : "Log out"}</button>
     {logout.error && <p role="alert" className="text-sm text-[var(--accent)]">{accountError(logout.error)}</p>}
   </fieldset>;
@@ -189,7 +192,7 @@ function AccountControls({ me }: { me: Me }) {
         </form>}
     </section> : <section className="card p-4">
       <h2 className="section-title">Delete account</h2>
-      <p className="mt-2 text-sm leading-6 text-[var(--dim)]">Permanently delete your account and your personal training data and files. This cannot be undone.{me.role === "coach" && " Athletes and their training data stay with the team."}</p>
+      <p className="mt-2 text-sm leading-6 text-[var(--dim)]">{me.role === "coach" ? "Permanently delete your account. This cannot be undone. Athletes, their training data and the team meals you posted stay with the team." : "Permanently delete your account and your personal training data and files. This cannot be undone."}</p>
       <form className="mt-3 space-y-3" onSubmit={(event) => {
         event.preventDefault();
         if (window.confirm("Permanently delete your account and personal training data? This cannot be undone.")) deleteAccount.mutate();

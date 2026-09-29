@@ -6,8 +6,9 @@ single-page app served from the same Worker. Installable as a PWA on iOS and And
 
 One deployment is one shared team. Every coach can view and edit every athlete's
 **plans** and view **weekly/cycle summaries**, while individual log entries
-(sessions, scores, notes) stay private. The first coach is the **owner** and can
-invite other coaches.
+(sessions, scores, notes) stay private. Coaches get a team overview on Today and
+can post meals to every athlete's Fuel; they have no personal training data of
+their own. The first coach is the **owner** and can invite other coaches.
 
 This README is the quick start. The [aspec design reference](aspec/foundation.md)
 describes architecture, permissions, UX and operations.
@@ -171,9 +172,11 @@ creator to remain owner when accepted.
 
 | Capability | Athlete | Coach | Owner (initially first coach) |
 |---|---|---|---|
-| Own training data and export/import | Full access | Full access | Full access |
+| Own training data and export/import | Full access | None | None |
 | Athlete plans, schedule and attachments | Own only | View/edit all athletes | View/edit all athletes |
 | Athlete weekly/cycle summaries | Own only | View all athletes | View all athletes |
+| Team overview (coach Today) | No | Yes | Yes |
+| Team meals in Fuel | Read | Add/edit/delete any | Add/edit/delete any |
 | Other users' individual logs, scores, notes, gear, maintenance | No access | No access | No access |
 | Invite athletes | No | Yes | Yes |
 | Invite coaches / list coaches | No | No | Yes |
@@ -195,10 +198,12 @@ instead of deletion. Forgotten passwords require the
 
 ## Data export / import
 
-Both roles get **Settings → Export my data**: a single JSON download
+Athletes get **Settings → Export my data**: a single JSON download
 (`dga-export-YYYYMMDD.json`) containing the account's full training data, and a
 matching **Import** that replaces the account's data after validation. Export is
-strictly per-account — there is no cross-user export.
+strictly per-account — there is no cross-user export. Coaches have no personal
+training data, so they have no export/import (the API returns 403). Team meals
+are team data: they are not exported and import never creates them.
 
 Limitation: uploaded document/photo attachments live in R2 and are **not**
 included in the JSON export (link attachments are). Re-upload files after an
@@ -238,7 +243,7 @@ src/
   lib/                auth, RBAC, rate limits, shared validation, dates and HTTP helpers
   routes/             thin auth, tracker, coach and transfer handlers
   services/           auth/team, plan/dashboard, sessions/scores, maintenance,
-                      setups, inspiration, attachments and import/export
+                      setups, inspiration, team meals, attachments and import/export
 migrations/           reviewed SQL migrations and drizzle-kit metadata
 scripts/db-check.mjs  schema/migration no-diff check
 frontend/
@@ -248,7 +253,7 @@ frontend/
   src/
     App.tsx           auth/query gates and tab shell
     api.ts            typed API client
-    features/         auth, dashboard, log, plan, gear, fuel, team and settings
+    features/         auth, coach, dashboard, log, plan, gear, fuel, team and settings
     components/       shared UI, navigation and SafeLink
     lib/              client date/format/mutation helpers
     theme.css         Tailwind v4 theme
@@ -277,6 +282,8 @@ for validation, error statuses and response formats.
   public auth writes are limited (429/503).
 - Invitations: `POST/GET /api/auth/invites` and `DELETE /api/auth/invites/:id`
   (coach; creating a coach invite requires the owner).
+- Tracker, personal plans, gear/checks and transfer below are athlete-only;
+  coaches get 403. `GET /api/plan/attachments/:id/file` serves both roles.
 - Tracker/log: `GET /api/tracker?today=YYYY-MM-DD&before=YYYY-MM-DD,id`
   (optional date/history cursor), `POST /api/sessions`,
   `PUT/DELETE /api/sessions/:id`, `POST /api/scores`,
@@ -292,6 +299,11 @@ for validation, error statuses and response formats.
 - Team: `GET /api/coach/athletes`, `GET /api/coach/coaches` (owner only),
   `GET /api/coach/athletes/:athleteId/overview` (200; 400 invalid query or
   404 missing/non-athlete target). Coach listing returns 200 or 403 for non-owners.
+  `GET /api/coach/overview?today=YYYY-MM-DD` returns every active athlete's
+  current cycle, arrow totals and averages (200; 400 invalid query).
+- Team meals: `GET/POST /api/coach/meals` and `PUT/DELETE /api/coach/meals/:id`
+  (coach; any coach may change any meal; 400 invalid ID, 404 missing meal,
+  writes limited 429/503). Athletes see them in `/api/tracker` `recipes[]`.
 - Coach plan editing under `/api/coach/athletes/:athleteId`:
   `PUT /plan/sessions`, `PUT /plan/weeks`, `POST /plan/adjust`,
   `POST /plan/sessions/links`, `POST /plan/sessions/files`,
@@ -310,7 +322,7 @@ also return 400 for invalid bodies and 415 for the wrong Content-Type.
 | `GET /api/coach/athletes[?include=deactivated]` | 200 `{ athletes }`, each with ISO/null `deactivatedAt`; 400 other include values |
 | `POST /api/coach/athletes/:athleteId/deactivate` | No body; idempotent 200 athlete summary; 404 missing/non-athlete target |
 | `POST /api/coach/athletes/:athleteId/reactivate` | No body; idempotent 200 athlete summary; 404 missing/non-athlete target |
-| `POST /api/plan/sessions/files` | Raw body with `dayKey`, `kind`, `label` query and file MIME; 200 `{ id }`; 400 invalid metadata/length/body or changed account/lease, 401 unavailable account, 413 size/quota/unknown accounting, 415 MIME, 429/503, 500 `Upload failed` |
+| `POST /api/plan/sessions/files` | Athlete; raw body with `dayKey`, `kind`, `label` query and file MIME; 200 `{ id }`; 400 invalid metadata/length/body or changed account/lease, 401 unavailable account, 413 size/quota/unknown accounting, 415 MIME, 429/503, 500 `Upload failed` |
 | `POST /api/coach/athletes/:athleteId/plan/sessions/files` | Same raw transport/statuses; additionally 403 role and 404 target; charged to athlete |
 
 Browser uploads send the original File and never set Content-Length themselves.

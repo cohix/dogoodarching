@@ -20,8 +20,11 @@ Authentication:
 RBAC:
 
 - [Foundation](../foundation.md#personas) owns permissions and account lifecycle rules. Authentication joins an unexpired session to an active user. Session creation also checks active state, preventing login/deactivation races from leaving a session that reactivation would revive. `resolveAthlete` accepts active or deactivated athletes, never coaches.
+- `requireCoach` guards every `/api/coach/*` route. `requireAthlete`, its counterpart, is applied per route to every personal tracker route and to export/import, so coaches receive 403 `{ error: "Forbidden" }` there; unknown `/api/*` paths still return 404. The shared file download and `/api/auth/*` are not athlete-gated. Coaches have no personal training data, and migration 0008 removed any they had.
 - Personal services receive the authenticated user ID; coach services receive the resolved athlete ID. Downloads have the explicit foundation exception.
 - `getCoachOverview` never calls `getTrackerPayload`. Its six queries read program state, cycle week plans, planned overrides, attachments, SQL weekly arrow sums and distinct session dates. Training queries project only aggregates/date, with user/date bounds; they never select session notes, focus or score. Private scores, weekly notes, setups, maintenance, milestones and inspiration tables are not queried. The five-field response remains unchanged. Query-projection tests enforce this boundary as well as checking response privacy.
+- `getCoachTeamOverview` (coach Today) follows the same rule and never calls `getTrackerPayload`. It references only `users` id/username for active athletes, program state (poundage, cycle, week, anchor), and `training_sessions` user ID, session date, and arrows/IDs inside SQL `sum`/`count`. It never selects session notes, focus or score and never queries scores, weekly notes, setups, maintenance, milestones or inspiration. Queries are batched by athlete-ID chunks, never per athlete.
+- Coaches write team meals, which every athlete reads through `/api/tracker`. Meal responses identify authors and editors only by username (or `Coach` after deletion), never by user ID. Coaches never read athletes' own inspiration entries: coach meal routes query only `team_meals` and usernames.
 
 Failed supported lower-count password checks perform dummy PBKDF2 work to reach 100,000 total iterations, comparable to unknown/deactivated users. A losing conditional rehash fails authentication, and login session insertion checks the exact verified/upgraded hash so password change or operator reset cannot be followed by a stale-password session.
 
@@ -45,7 +48,7 @@ The download service permits the attachment's owner or any coach; other callers 
 
 MIME metadata is trimmed, lowercased and stripped of parameters. Unsupported/missing types are rejected on upload; legacy downloads use `application/octet-stream` and a `.bin` extension for unsupported metadata. No file-magic inspection is performed.
 
-Files are limited to 8,000,000 bytes each and 100 files / 500,000,000 bytes per target account, excluding links. Personal uploads by either role use their own quota; coach uploads use the athlete's quota. Atomic admission counts committed files plus live reservations and rejects unknown sizes rather than counting them as zero. Above-quota accounts retain reads/deletes/links. See [upload transport](apis.md#design), [reservation design](design.md#component-7) and the [backfill rollout](../devops/operations.md#ongoing-operations).
+Files are limited to 8,000,000 bytes each and 100 files / 500,000,000 bytes per target account, excluding links. Personal uploads (athletes only) use the athlete's own quota; coach uploads use the athlete's quota. Atomic admission counts committed files plus live reservations and rejects unknown sizes rather than counting them as zero. Above-quota accounts retain reads/deletes/links. See [upload transport](apis.md#design), [reservation design](design.md#component-7) and the [backfill rollout](../devops/operations.md#ongoing-operations).
 
 Same-origin file links use plain anchors under `/api/plan/attachments/` to preserve PWA session context. External HTTP(S) links open with `noopener noreferrer`.
 
@@ -61,9 +64,10 @@ Same-origin file links use plain anchors under `/api/plan/attachments/` to prese
 | Accept invite | `accept-invite:<ip>` | 10 |
 | Create invite | `invite-create:<acting coach ID>` | 10 |
 | Upload (personal or coach) | `upload:<acting user ID>` | 10 |
+| Team meal create/update/delete | shared `team-meal:<acting coach ID>` | 10 |
 | Password change, account deletion, ownership transfer | shared `password-verify:<acting user ID>` | 5 |
 
-IP checks precede body parsing; username checks follow validation but precede hashing without looking up username existence. Password-verification limits follow body validation and precede hashing. Upload limits precede body reading. IP uses only `CF-Connecting-IP`, falling back to `unknown`, never `X-Forwarded-For`.
+IP checks precede body parsing; username checks follow validation but precede hashing without looking up username existence. Password-verification limits follow body validation and precede hashing. Upload and team meal limits precede body reading, so invalid meal bodies still count. IP uses only `CF-Connecting-IP`, falling back to `unknown`, never `X-Forwarded-For`.
 
 Denial returns 429 `Too many attempts. Try again later.` Missing/erroring bindings and unknown mock modes fail closed with 503 `Service temporarily unavailable. Try again later.` Production/preview namespaces are distinct in [infrastructure](../devops/infrastructure.md#architecture). Explicit test mocks are documented in [local development](../devops/localdev.md#workflows); they are not configured in deployed environments.
 

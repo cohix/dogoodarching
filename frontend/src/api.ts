@@ -118,6 +118,25 @@ export interface Recipe {
   ingredients: string;
   instructions: string;
   updatedAt: string;
+  /** "own": the athlete's daily check-in; "team": a meal posted by a coach. */
+  source: "own" | "team";
+  /** Stable React key (`own:<id>` / `team:<id>`); the two id spaces collide. */
+  key: string;
+  /** Team meals only: the author's display name, or "Coach" once the author is deleted. */
+  author: string | null;
+}
+export interface TeamMealInput {
+  name: string;
+  summary: string;
+  ingredients: string;
+  instructions: string;
+}
+export interface TeamMeal extends TeamMealInput {
+  id: number;
+  author: string;
+  updatedBy: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 export interface MaintenanceItem {
   id: number;
@@ -184,6 +203,22 @@ export interface CoachAthleteOverview {
   plannedSessions: PlannedSession[];
   weeklyArrows: { week: string; arrows: number }[];
   cycleSummaries: CycleSummary[];
+}
+
+/** One active athlete on the coach Today list; averages are unrounded. */
+export interface CoachTeamAthlete {
+  id: string;
+  username: string;
+  displayName: string;
+  currentPoundage: number | null;
+  currentCycle: number;
+  currentWeek: number;
+  currentCycleSummary: CycleSummary;
+  cycleArrows: number;
+  cycleSessions: number;
+  averagePerWeek: number;
+  /** null when no sessions were logged this cycle. */
+  averagePerSession: number | null;
 }
 
 export interface ExportPayload {
@@ -337,6 +372,8 @@ export const api = {
   deactivateAthlete: (athleteId: string) => post<AthleteSummary>(`/api/coach/athletes/${encodeURIComponent(athleteId)}/deactivate`),
   reactivateAthlete: (athleteId: string) => post<AthleteSummary>(`/api/coach/athletes/${encodeURIComponent(athleteId)}/reactivate`),
   listCoaches: () => get<{ coaches: CoachSummary[] }>("/api/coach/coaches"), // owner only (403 otherwise)
+  coachOverview: (today: string) =>
+    get<{ athletes: CoachTeamAthlete[] }>(`/api/coach/overview?today=${encodeURIComponent(today)}`),
   athleteOverview: (athleteId: string, today: string) =>
     get<CoachAthleteOverview>(
       `/api/coach/athletes/${encodeURIComponent(athleteId)}/overview?today=${encodeURIComponent(today)}`,
@@ -370,7 +407,13 @@ export const api = {
       args,
     ),
 
-  // ---- export / import (own account only) ----
+  // ---- team meals (any coach may edit or delete any meal) ----
+  listTeamMeals: () => get<{ meals: TeamMeal[] }>("/api/coach/meals"),
+  addTeamMeal: (args: TeamMealInput) => post<TeamMeal>("/api/coach/meals", args),
+  updateTeamMeal: ({ id, ...args }: { id: number } & TeamMealInput) => put<TeamMeal>(`/api/coach/meals/${id}`, args),
+  deleteTeamMeal: (args: { id: number }) => del<{ ok: true }>(`/api/coach/meals/${args.id}`),
+
+  // ---- export / import (own athlete account only) ----
   exportData: () => get<ExportPayload>("/api/export"),
   importData: (payload: ExportPayload) =>
     post<{ ok: true; counts: Record<string, number> }>("/api/import", payload),

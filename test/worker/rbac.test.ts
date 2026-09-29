@@ -1,7 +1,9 @@
 // RBAC matrix across every /api/coach/* route, plus the attachment download rule.
+import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { addOwnLink, countRows, filePayload, setupTeam, uploadFileForAthlete, uploadOwnFile, type Team } from "./auth-fixtures";
 import { api, apiJson, uploadFile, type RequestOptions, type Session } from "./helpers";
+import { addItem, addScore, addSession, addSetup, scoreBody, sessionBody, setupBody } from "./tracker-fixtures";
 
 /** Every coach route. `body` is a valid payload; `setup` creates any row the route needs. */
 interface CoachRoute {
@@ -180,8 +182,8 @@ describe("attachment downloads (GET /api/plan/attachments/:id/file)", () => {
     const team = await setupTeam();
     const idA = await uploadOwnFile(team.athleteA);
     expect((await api(`/api/plan/attachments/${idA}`, { method: "DELETE", cookie: team.athleteB.cookie })).status).toBe(404);
-    // The athlete-scoped delete route is scoped to the caller even for coaches; they must use the coach route.
-    expect((await api(`/api/plan/attachments/${idA}`, { method: "DELETE", cookie: team.owner.cookie })).status).toBe(404);
+    // The athlete-scoped delete route is athlete-only (0003 §5); coaches must use the coach route.
+    expect((await api(`/api/plan/attachments/${idA}`, { method: "DELETE", cookie: team.owner.cookie })).status).toBe(403);
     expect(await countRows("planned_session_attachments")).toBe(1);
     expect((await api(`/api/plan/attachments/${idA}/file`, { cookie: team.athleteA.cookie })).status).toBe(200);
     // The owner of the attachment can delete it.
@@ -201,17 +203,145 @@ describe("attachment downloads (GET /api/plan/attachments/:id/file)", () => {
   });
 });
 
-describe("athlete routes stay private to the athlete", () => {
-  it("coaches cannot read an athlete's tracker payload through /api/tracker (they get their own, empty one)", async () => {
+/**
+ * Every personal (athlete-only) route with a body that is valid for an athlete,
+ * so a 403 cannot be a validation error in disguise. Ids point at the athlete's
+ * real rows (created in the test) where a route takes one.
+ */
+function personalRoutes(ids: { session: number; score: number; attachment: number; item: number; setup: number }) {
+  return [
+    { method: "GET", path: "/api/tracker" },
+    { method: "GET", path: "/api/tracker?today=2026-09-28" },
+    { method: "POST", path: "/api/notes/weekly", json: { today: "2026-09-28", notes: "coach note" } },
+    { method: "POST", path: "/api/sessions", json: sessionBody() },
+    { method: "PUT", path: `/api/sessions/${ids.session}`, json: sessionBody() },
+    { method: "DELETE", path: `/api/sessions/${ids.session}` },
+    { method: "POST", path: "/api/scores", json: scoreBody() },
+    { method: "DELETE", path: `/api/scores/${ids.score}` },
+    { method: "POST", path: "/api/plan/sessions", json: { dayKey: "mon", sessionType: "Range", detail: "Blank bale", prescription: "60 arrows" } },
+    { method: "POST", path: "/api/plan/sessions/links", json: { dayKey: "tue", label: "Video", url: "https://example.org/video" } },
+    { method: "POST", path: "/api/plan/sessions/files", upload: true },
+    { method: "DELETE", path: `/api/plan/attachments/${ids.attachment}` },
+    { method: "POST", path: "/api/plan/weeks", json: { weekNumber: 1, primaryFocus: "Release", backgroundFocusOne: "", backgroundFocusTwo: "" } },
+    { method: "POST", path: "/api/plan/adjust", json: { adjustment: "forward", today: "2026-09-28" } },
+    { method: "POST", path: "/api/plan/poundage", json: { poundage: 30, today: "2026-09-28" } },
+    { method: "POST", path: "/api/checks", json: { group: "milestone", key: "m1", checked: true } },
+    { method: "POST", path: "/api/maintenance/items", json: { section: "Weekly", label: "Wax string" } },
+    { method: "PUT", path: `/api/maintenance/items/${ids.item}`, json: { label: "Wax string" } },
+    { method: "DELETE", path: `/api/maintenance/items/${ids.item}` },
+    { method: "POST", path: `/api/maintenance/items/${ids.item}/check`, json: { checked: true } },
+    { method: "POST", path: "/api/maintenance/sections/clear", json: { section: "Weekly" } },
+    { method: "POST", path: "/api/setups", json: setupBody() },
+    { method: "POST", path: "/api/setups", json: setupBody({ id: ids.setup }) },
+    { method: "POST", path: `/api/setups/${ids.setup}/duplicate`, json: { poundage: 30 } },
+    { method: "POST", path: "/api/inspiration", json: { thoughtText: "t", videoTitle: "v", videoUrl: "https://example.org/v", recipeName: "r", recipeSummary: "s", recipeIngredients: "i", recipeInstructions: "m" } },
+    { method: "GET", path: "/api/export" },
+    { method: "POST", path: "/api/import", json: { version: 1 } },
+  ] as Array<{ method: string; path: string; json?: unknown; upload?: boolean }>;
+}
+
+const PERSONAL_TABLES = ["training_sessions", "practice_scores", "practice_score_ends", "planned_session_overrides", "planned_session_attachments",
+  "cycle_week_plans", "program_state", "milestone_checks", "maintenance_items", "maintenance_checks", "bow_setups", "inspiration_entries",
+  "weekly_notes", "upload_reservations"];
+
+async function seedAthleteRows(athlete: Session) {
+  return {
+    session: await addSession(athlete),
+    score: await addScore(athlete),
+    attachment: await uploadOwnFile(athlete),
+    item: await addItem(athlete, "Weekly", "Check nocks"),
+    setup: await addSetup(athlete),
+  };
+}
+
+describe("personal routes are athlete-only (0003 §5)", () => {
+  it("every coach (owner or not) gets 403, never 500, on every personal tracker route and on export/import, and nothing is written", async () => {
     const team = await setupTeam();
-    await api("/api/sessions", {
-      json: { sessionDate: "2026-09-28", sessionType: "Range", customActivity: "", arrows: 60, durationMinutes: 45, focus: "", score: "", notes: "" },
-      cookie: team.athleteA.cookie,
-    });
-    const coachView = await apiJson<{ sessions: unknown[] }>("/api/tracker", { cookie: team.coach.cookie });
-    expect(coachView.status).toBe(200);
-    expect(coachView.body.sessions).toEqual([]);
-    const athleteView = await apiJson<{ sessions: unknown[] }>("/api/tracker", { cookie: team.athleteA.cookie });
+    const ids = await seedAthleteRows(team.athleteA);
+    const before = await Promise.all(PERSONAL_TABLES.map((table) => countRows(table)));
+    const objects = (await env.ATTACHMENTS.list()).objects.length;
+    for (const coach of [team.owner, team.coach]) {
+      for (const route of personalRoutes(ids)) {
+        const result = route.upload
+          ? await uploadFile(route.path, coach, filePayload())
+          : await api(route.path, { method: route.method, json: route.json, cookie: coach.cookie });
+        expect(result.status, `${coach.user.username} ${route.method} ${route.path}`).toBe(403);
+        expect(await result.json()).toEqual({ error: "Forbidden" });
+      }
+    }
+    expect(await Promise.all(PERSONAL_TABLES.map((table) => countRows(table)))).toEqual(before);
+    expect((await env.ATTACHMENTS.list()).objects).toHaveLength(objects);
+    for (const table of PERSONAL_TABLES) {
+      expect(await countRows(table, "user_id IN (?, ?)", team.owner.user.id, team.coach.user.id), table).toBe(0);
+    }
+    // The athlete's own rows are intact and readable.
+    const athleteView = await apiJson<{ sessions: unknown[]; setups: unknown[] }>("/api/tracker", { cookie: team.athleteA.cookie });
+    expect(athleteView.status).toBe(200);
     expect(athleteView.body.sessions).toHaveLength(1);
+    expect(athleteView.body.setups).toHaveLength(1);
+  });
+
+  it("the same bodies succeed for the athlete, so the coach 403 is not a validation error", async () => {
+    const team = await setupTeam();
+    const ids = await seedAthleteRows(team.athleteA);
+    // Deletes and the import (which needs a full payload) are covered elsewhere;
+    // every other request must be accepted for the athlete.
+    for (const route of personalRoutes(ids).filter((r) => r.method !== "DELETE" && r.path !== "/api/import")) {
+      const result = route.upload
+        ? await uploadFile(route.path, team.athleteA, filePayload())
+        : await api(route.path, { method: route.method, json: route.json, cookie: team.athleteA.cookie });
+      expect(result.status, `athlete ${route.method} ${route.path}`).toBe(200);
+    }
+  });
+
+  it("the 403 runs before validation: an invalid body or id from a stale coach client still gets 403", async () => {
+    const team = await setupTeam();
+    const ids = { session: 0, score: 0, attachment: 0, item: 0, setup: 0 };
+    for (const route of personalRoutes(ids).filter((r) => r.method !== "GET")) {
+      const path = route.path.replace("/0", "/not-a-number");
+      const result = route.upload
+        ? await api(path, { method: "POST", body: "not a file", headers: { "content-type": "text/plain" }, cookie: team.coach.cookie })
+        : await api(path, { method: route.method, json: { nonsense: true }, cookie: team.coach.cookie });
+      expect(result.status, `${route.method} ${path}`).toBe(403);
+    }
+    expect((await api("/api/tracker?today=nope", { cookie: team.coach.cookie })).status).toBe(403);
+  });
+
+  it("anonymous callers still get 401, and unknown /api paths still 404 for a coach", async () => {
+    const team = await setupTeam();
+    expect((await api("/api/does-not-exist", { cookie: team.coach.cookie })).status).toBe(404);
+    for (const route of personalRoutes({ session: 1, score: 1, attachment: 1, item: 1, setup: 1 })) {
+      expect((await api(route.path, { method: route.method, json: route.json })).status, `anonymous ${route.method} ${route.path}`).toBe(401);
+    }
+  });
+
+  it("coach writes into athlete plans still succeed and land under the athlete", async () => {
+    const team = await setupTeam();
+    const athleteId = team.athleteA.user.id;
+    expect((await api(`/api/coach/athletes/${athleteId}/plan/sessions`, {
+      method: "PUT", json: { dayKey: "mon", sessionType: "Range", detail: "Coach detail", prescription: "90 arrows" }, cookie: team.coach.cookie,
+    })).status).toBe(200);
+    expect((await api(`/api/coach/athletes/${athleteId}/plan/weeks`, {
+      method: "PUT", json: { weekNumber: 1, primaryFocus: "Coach focus", backgroundFocusOne: "", backgroundFocusTwo: "" }, cookie: team.owner.cookie,
+    })).status).toBe(200);
+    expect((await api(`/api/coach/athletes/${athleteId}/plan/adjust`, {
+      json: { adjustment: "forward", today: "2026-09-28" }, cookie: team.owner.cookie,
+    })).status).toBe(200);
+    expect((await api(`/api/coach/athletes/${athleteId}/plan/sessions/links`, {
+      json: { dayKey: "tue", label: "Coach link", url: "https://example.org/c" }, cookie: team.coach.cookie,
+    })).status).toBe(200);
+    const fileId = await uploadFileForAthlete(team.owner, athleteId);
+    // Coaches still download athlete plan files through the shared (ungated) route.
+    expect((await api(`/api/plan/attachments/${fileId}/file`, { cookie: team.coach.cookie })).status).toBe(200);
+    expect((await api(`/api/plan/attachments/${fileId}/file`, { cookie: team.athleteA.cookie })).status).toBe(200);
+    expect(await countRows("planned_session_attachments", "user_id = ?", athleteId)).toBe(2);
+    expect(await countRows("planned_session_overrides", "user_id = ?", athleteId)).toBe(1);
+    expect(await countRows("cycle_week_plans", "user_id = ?", athleteId)).toBe(1);
+    expect(await countRows("program_state", "user_id = ?", athleteId)).toBe(1);
+    for (const table of PERSONAL_TABLES) {
+      expect(await countRows(table, "user_id IN (?, ?)", team.owner.user.id, team.coach.user.id), table).toBe(0);
+    }
+    // The coach can delete the file they uploaded through the coach route.
+    expect((await api(`/api/coach/athletes/${athleteId}/plan/attachments/${fileId}`, { method: "DELETE", cookie: team.coach.cookie })).status).toBe(200);
   });
 });

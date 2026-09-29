@@ -6,7 +6,7 @@
  */
 import { createExecutionContext, env } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
-import { api, apiJson, bootstrapCoach, bootstrapTeam, uploadFile, type Session } from "./helpers";
+import { api, apiJson, bootstrapTeam, uploadFile, type Session } from "./helpers";
 import { count, FILE_BYTES, parseContentDisposition, post, rows, setupSquad, tracker } from "./tracker-fixtures";
 
 import worker from "../../src/index";
@@ -14,6 +14,9 @@ import { getDb } from "../../src/db";
 import { UPLOAD_MIME_TYPES } from "../../src/lib/validation";
 import { backfillAttachmentSizes } from "../../src/services/attachments";
 import { attemptBlobCleanup, enqueueBlobCleanup, runScheduledCleanup } from "../../src/services/cleanup";
+
+/** Personal uploads are athlete-only (0003 §5); an athlete is the cheapest uploader. */
+const bootstrapAthlete = async () => (await bootstrapTeam()).athlete;
 
 const download = (session: Session | null, id: number) => api(`/api/plan/attachments/${id}/file`, { cookie: session?.cookie });
 
@@ -148,13 +151,17 @@ describe("attachment download access", () => {
     expect(await rows("SELECT user_id FROM planned_session_attachments WHERE id = ?", id)).toEqual([{ user_id: athlete.user.id }]);
   });
 
-  it("a coach's own file is hidden from athletes and open to the other coach", async () => {
-    const { owner, coach, athlete } = await setupSquad();
-    const id = await upload(coach, { label: "Coach notes" });
-
-    await expectFile(await download(coach, id), "application/pdf");
-    await expectFile(await download(owner, id), "application/pdf");
-    await expectHidden(await download(athlete, id));
+  it("coaches have no personal files: the personal upload route is 403 and stores nothing (0003 §5)", async () => {
+    const { owner, coach } = await setupSquad();
+    for (const session of [owner, coach]) {
+      const response = await uploadFile("/api/plan/sessions/files", session, { label: "Coach notes" });
+      expect(response.status).toBe(403);
+      expect(await response.json()).toEqual({ error: "Forbidden" });
+      // Refused before the body is read: raw bodies and oversize declarations get the same 403.
+      expect((await rawUpload(session, chunks(1), { "x-file-size": "999999999999" })).status).toBe(403);
+    }
+    await noUploadLeft();
+    expect(await count("planned_session_attachments")).toBe(0);
   });
 
   it("an id that does not exist is the same 404 another athlete's file gives", async () => {
@@ -238,7 +245,7 @@ async function noUploadLeft() {
 
 describe("raw uploads and accounting", () => {
   it.each(["text/html", "image/svg+xml", "application/json", "text/plain", "", "application/octet-stream"])("rejects %j with 415", async (mimeType) => {
-    const session = await bootstrapCoach();
+    const session = await bootstrapAthlete();
     const response = await rawUpload(session, FILE_BYTES, { "content-type": mimeType });
     expect(response.status).toBe(415);
     expect(await response.json()).toEqual({ error: "Unsupported file type" });
@@ -246,7 +253,7 @@ describe("raw uploads and accounting", () => {
   });
 
   it.each(UPLOAD_MIME_TYPES)("accepts allowlisted %s with normalized metadata", async (mimeType) => {
-    const session = await bootstrapCoach();
+    const session = await bootstrapAthlete();
     const response = await rawUpload(session, new File([FILE_BYTES], "plan", { type: mimeType }), { "content-type": ` ${mimeType.toUpperCase()}; charset=binary` });
     expect(response.status).toBe(200);
     const { id } = await response.json() as { id: number };
@@ -256,7 +263,7 @@ describe("raw uploads and accounting", () => {
   });
 
   it.each(["8000001", "9007199254740992"])("rejects declared oversize %s before pulling a byte", async (length) => {
-    const session = await bootstrapCoach();
+    const session = await bootstrapAthlete();
     let pulled = false;
     const body = new ReadableStream<Uint8Array>({ pull(c) { pulled = true; c.enqueue(FILE_BYTES); c.close(); } }, { highWaterMark: 0 });
     const response = await rawUpload(session, body, { "content-length": length });
@@ -273,7 +280,7 @@ describe("raw uploads and accounting", () => {
     ["over cap with false length", [4_000_000, 4_000_001], "8000000", 413, "Attachment is larger than 8 MB"],
     ["empty", [], "0", 400, "File body is required"],
   ] as const)("rejects a stream %s and leaves no blob", async (_name, sizes, length, status, error) => {
-    const session = await bootstrapCoach();
+    const session = await bootstrapAthlete();
     const response = await rawUpload(session, chunks(...sizes), length === null ? {} : { "content-length": length });
     expect(response.status).toBe(status);
     expect(await response.json()).toEqual({ error });
@@ -281,13 +288,13 @@ describe("raw uploads and accounting", () => {
   });
 
   it.each(["-1", "abc", "1.5"])("rejects invalid length %s", async (length) => {
-    const response = await rawUpload(await bootstrapCoach(), chunks(1), { "content-length": length });
+    const response = await rawUpload(await bootstrapAthlete(), chunks(1), { "content-length": length });
     expect(response.status).toBe(400);
     expect(await response.json()).toEqual({ error: "Invalid Content-Length" });
   });
 
   it("accepts browser size metadata without Content-Length, an exact length, and exactly 8 MB", async () => {
-    const session = await bootstrapCoach();
+    const session = await bootstrapAthlete();
     for (const [sizes, headers] of [[[2, 3], { "x-file-size": "5" }], [[2, 3], { "content-length": "5" }], [[4_000_000, 4_000_000], { "x-file-size": "8000000" }]] as const) {
       const response = await rawUpload(session, chunks(...sizes), headers);
       expect(response.status).toBe(200);
@@ -297,7 +304,7 @@ describe("raw uploads and accounting", () => {
   });
 
   it("rejects the 101st file, while links and deletion still work", async () => {
-    const session = await bootstrapCoach();
+    const session = await bootstrapAthlete();
     await seedFiles(session.user.id, Array(100).fill(1));
     const response = await rawUpload(session, FILE_BYTES);
     expect(response.status).toBe(413);
@@ -311,7 +318,7 @@ describe("raw uploads and accounting", () => {
   });
 
   it("rejects the byte past 500 MB and permits the exact boundary", async () => {
-    const session = await bootstrapCoach();
+    const session = await bootstrapAthlete();
     await seedFiles(session.user.id, [499_999_999]);
     const first = await rawUpload(session, chunks(1), { "x-file-size": "1" });
     expect(first.status).toBe(200);
@@ -336,7 +343,7 @@ describe("raw uploads and accounting", () => {
   });
 
   it.each(["files", "bytes"])("atomic reservations stop concurrent uploads at the %s boundary", async (boundary) => {
-    const session = await bootstrapCoach();
+    const session = await bootstrapAthlete();
     await seedFiles(session.user.id, boundary === "files" ? Array(99).fill(1) : [499_999_999]);
     const responses = await Promise.all([rawUpload(session, chunks(1), { "x-file-size": "1" }), rawUpload(session, chunks(1), { "x-file-size": "1" })]);
     expect(responses.map(r => r.status).sort()).toEqual([200, 413]);
@@ -346,7 +353,7 @@ describe("raw uploads and accounting", () => {
   });
 
   it("returns only Upload failed on an R2 failure and releases the reservation", async () => {
-    const session = await bootstrapCoach();
+    const session = await bootstrapAthlete();
     const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       const bucket = bucketWith({ put: async () => { throw new Error("secret upstream token"); } });
@@ -375,7 +382,7 @@ describe("raw uploads and accounting", () => {
   });
 
   it("sanitizes legacy download MIME and filename together", async () => {
-    const session = await bootstrapCoach();
+    const session = await bootstrapAthlete();
     const id = await upload(session);
     await env.DB.prepare("UPDATE planned_session_attachments SET mime_type = 'text/html', label = 'evil.html' WHERE id = ?").bind(id).run();
     const response = await download(session, id);
@@ -394,7 +401,7 @@ function bucketWith(overrides: Partial<R2Bucket>): R2Bucket {
 
 describe("upload recovery and size backfill", () => {
   it.each([false, true])("cleanup fences only expired uploads (expired=%s)", async (expired) => {
-    const session = await bootstrapCoach();
+    const session = await bootstrapAthlete();
     const bucket = bucketWith({ put: async (...args: Parameters<R2Bucket["put"]>) => {
       const result = await env.ATTACHMENTS.put(...args);
       if (expired) await runScheduledCleanup(env, new Date(Date.now() + 3600_001));
@@ -428,7 +435,7 @@ describe("upload recovery and size backfill", () => {
   });
 
   it("retains durable cleanup on deletion failure, then retries", async () => {
-    const session = await bootstrapCoach();
+    const session = await bootstrapAthlete();
     const bucket = bucketWith({
       put: async (...args: Parameters<R2Bucket["put"]>) => {
         await env.ATTACHMENTS.put(...args);
@@ -446,7 +453,7 @@ describe("upload recovery and size backfill", () => {
   });
 
   it("expired reservations release quota and preserve recovery for a late put", async () => {
-    const session = await bootstrapCoach();
+    const session = await bootstrapAthlete();
     const now = new Date();
     await env.DB.prepare("INSERT INTO upload_reservations VALUES ('abandoned', ?, ?, 500000000, ?)")
       .bind(session.user.id, session.user.id, now.getTime() - 1).run();
@@ -462,7 +469,7 @@ describe("upload recovery and size backfill", () => {
   });
 
   it("backfills in bounded resumable batches; unknown/missing never count as zero", async () => {
-    const session = await bootstrapCoach();
+    const session = await bootstrapAthlete();
     await seedFiles(session.user.id, [null, null]);
     await env.ATTACHMENTS.put("seed/0", FILE_BYTES);
     const blocked = await rawUpload(session, FILE_BYTES);
@@ -483,7 +490,7 @@ describe("upload recovery and size backfill", () => {
   });
 
   it("failed heads rotate behind unattempted rows without completing accounting", async () => {
-    const session = await bootstrapCoach();
+    const session = await bootstrapAthlete();
     await seedFiles(session.user.id, [null, null]);
     await env.ATTACHMENTS.put("seed/1", FILE_BYTES);
     const bucket = bucketWith({ head: async () => { throw new Error("private head error"); } });
@@ -496,7 +503,7 @@ describe("upload recovery and size backfill", () => {
 });
 
 it("R2 starts consuming the stream before request EOF, with no full-file buffer", async () => {
-  const session = await bootstrapCoach();
+  const session = await bootstrapAthlete();
   let release!: () => void;
   const resume = new Promise<void>(resolve => { release = resolve; });
   let putStarted = false;
@@ -526,7 +533,7 @@ it("R2 starts consuming the stream before request EOF, with no full-file buffer"
 });
 
 it("a failing body source releases its reservation and leaves no permanent blob", async () => {
-  const session = await bootstrapCoach();
+  const session = await bootstrapAthlete();
   let chunks = 0;
   const body = new ReadableStream<Uint8Array>({ pull(c) {
     if (chunks++ === 0) c.enqueue(new Uint8Array([1, 2, 3]));
@@ -541,7 +548,7 @@ it("a failing body source releases its reservation and leaves no permanent blob"
 it("rejects conflicting browser size metadata without consuming the body", async () => {
   let read = false;
   const body = new ReadableStream<Uint8Array>({ pull(c) { read = true; c.close(); } }, { highWaterMark: 0 });
-  const response = await rawUpload(await bootstrapCoach(), body, { "x-file-size": "5", "content-length": "6" });
+  const response = await rawUpload(await bootstrapAthlete(), body, { "x-file-size": "5", "content-length": "6" });
   expect(response.status).toBe(400);
   expect(read).toBe(false);
   await noUploadLeft();

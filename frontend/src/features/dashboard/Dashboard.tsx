@@ -10,6 +10,7 @@ import { sessionLabel } from "../log/sessionHelpers";
 import { Inspiration } from "./Inspiration";
 import { PlannedSessionModal } from "../plan/PlannedSessionModal";
 import { PoundagePrompt } from "./PoundagePrompt";
+import { CycleWeeksGrid } from "./CycleWeeksGrid";
 
 function WeeklySessionRing({ days, onLog, completedToday }: { days: { date: string; label: string; status: TrainingDayStatus }[]; onLog: () => void; completedToday: boolean }) {
   const statusSummary = days.map((day) => `${day.label} ${day.status}`).join(", ");
@@ -67,9 +68,7 @@ export function Dashboard({ data, onLog, onSaved }: { data: Tracker; onLog: () =
       </div>
       <div className="mt-5 border-t border-white/15 pt-4">
         <div className="mb-3 flex items-center justify-between gap-3"><p className="text-xs font-bold text-white">Current cycle</p><p className="text-[10px] font-semibold text-[#a9d2bb]">6 weeks · 36 training days</p></div>
-        <div role="img" aria-label={`Six-week cycle progress. ${cycleWeeks.flatMap((week) => week.dayStatuses).filter((status) => status === "completed").length} completed, ${cycleWeeks.flatMap((week) => week.dayStatuses).filter((status) => status === "skipped").length} skipped. ${cycleWeeks.map((week) => `Week ${week.weekNumber}: ${week.arrows} arrows`).join(", ")}.`} className="grid grid-cols-6 gap-2">
-          {cycleWeeks.map((week) => <div key={week.weekNumber} className="min-w-0"><div className="flex gap-[2px]">{week.dayStatuses.map((status, dayIndex) => <span key={dayIndex} className="h-1.5 min-w-0 flex-1 rounded-full" style={{ backgroundColor: statusColor[status] }} />)}</div><p className={`mt-1.5 whitespace-nowrap text-center text-[9px] font-bold ${week.weekNumber === data.state.currentWeek ? "text-white" : "text-[#88a093]"}`}>W{week.weekNumber} ({week.arrows})</p></div>)}
-        </div>
+        <CycleWeeksGrid weeks={cycleWeeks} currentWeek={data.state.currentWeek} tone="hero" label={`Six-week cycle progress. ${cycleWeeks.flatMap((week) => week.dayStatuses).filter((status) => status === "completed").length} completed, ${cycleWeeks.flatMap((week) => week.dayStatuses).filter((status) => status === "skipped").length} skipped. ${cycleWeeks.map((week) => `Week ${week.weekNumber}: ${week.arrows} arrows`).join(", ")}.`} />
         <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-[10px] font-semibold text-[#c7dbcf]">{(["completed", "skipped", "upcoming"] as TrainingDayStatus[]).map((status) => <span key={status} className="flex items-center gap-1.5"><span className="h-2 w-2 rounded-full" style={{ backgroundColor: statusColor[status] }} />{status[0]?.toUpperCase()}{status.slice(1)}</span>)}</div>
         <div className="mt-4 grid grid-cols-2 divide-x divide-white/15 border-t border-white/15 pt-3 text-center"><div><p className="text-xl font-extrabold">{cycleTotal}</p><p className="text-[10px] font-bold uppercase tracking-[.06em] text-[#a9d2bb]">Cycle arrows</p></div><div><p className="text-xl font-extrabold">{formatAverage(cycleAverage)}</p><p className="text-[10px] font-bold uppercase tracking-[.06em] text-[#a9d2bb]">Average / week</p></div></div>
       </div>

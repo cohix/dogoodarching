@@ -214,3 +214,22 @@ export const bowSetups = sqliteTable("bow_setups", {
   sightMarksJson: text("sight_marks_json").notNull().default("{}"),
   updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull().$defaultFn(() => new Date()),
 }, (t) => [index("idx_bow_setups_user").on(t.userId)]);
+
+// ---------------------------------------------------------------------------
+// Team tables (0003 §3): shared by the whole deployment-wide team
+// ---------------------------------------------------------------------------
+
+// Coach-posted meals shown in every athlete's Fuel feed. Team data, not any
+// athlete's: excluded from personal export/import. Author/editor references
+// are nulled when a coach account is deleted, so the meal survives.
+export const teamMeals = sqliteTable("team_meals", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  authorId: text("author_id").references(() => users.id, { onDelete: "set null" }),
+  updatedBy: text("updated_by").references(() => users.id, { onDelete: "set null" }),
+  name: text("name").notNull().default(""),
+  summary: text("summary").notNull().default(""),
+  ingredients: text("ingredients").notNull().default(""),
+  instructions: text("instructions").notNull().default(""),
+  createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull().$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull().$defaultFn(() => new Date()),
+}, (t) => [index("idx_team_meals_created_at").on(t.createdAt)]);

@@ -1,6 +1,7 @@
 // Coach endpoints: view/edit any athlete's training plans. Coaches can NEVER
 // read an athlete's private log rows (sessions, scores, notes, gear,
-// maintenance, inspiration); the overview returns only the aggregate subset.
+// maintenance, inspiration); the overviews return only the aggregate subset.
+// Coaches also manage team meals, which every active athlete sees in Fuel.
 
 import { Hono } from "hono";
 import { getDb } from "../db";
@@ -9,12 +10,13 @@ import { dateKeyUtc } from "../lib/dates";
 import { jsonError, parsePositiveInt, validateJson, validateQuery } from "../lib/http";
 import { authMiddleware, requireCoach, resolveAthlete, type AppBindings } from "../lib/rbac";
 import {
-  adjustInput, athleteListQuery, cycleWeekPlanInput, plannedSessionInput, plannedSessionLinkInput, todayQuery,
+  adjustInput, athleteListQuery, cycleWeekPlanInput, plannedSessionInput, plannedSessionLinkInput, teamMealInput, todayQuery,
 } from "../lib/validation";
 import { uploadPlannedSessionFileFor, addPlannedSessionLinkFor, deletePlannedSessionAttachmentFor } from "../services/attachments";
-import { getCoachOverview } from "../services/dashboard";
+import { getCoachOverview, getCoachTeamOverview } from "../services/dashboard";
 import { adjustScheduleFor, saveCycleWeekPlanFor, savePlannedSessionFor } from "../services/plan";
 import { deactivateAthlete, listAthletes, listCoaches, reactivateAthlete } from "../services/team";
+import { createTeamMeal, deleteTeamMeal, listTeamMeals, updateTeamMeal } from "../services/team-meals";
 
 const coach = new Hono<AppBindings>();
 
@@ -49,6 +51,13 @@ coach.post("/athletes/:athleteId/reactivate", async (c) => {
   const status = await reactivateAthlete(getDb(c.env.DB), athlete.id);
   if (!status) return jsonError(c, 404, "Athlete not found");
   return c.json(status);
+});
+
+// Coach Today: current-cycle overview of every active athlete (same privacy
+// projection as the per-athlete overview below).
+coach.get("/overview", validateQuery(todayQuery), async (c) => {
+  const today = c.req.valid("query").today ?? dateKeyUtc(new Date());
+  return c.json(await getCoachTeamOverview(getDb(c.env.DB), today));
 });
 
 coach.get("/athletes/:athleteId/overview", validateQuery(todayQuery), async (c) => {
@@ -95,6 +104,31 @@ coach.delete("/athletes/:athleteId/plan/attachments/:attachmentId", async (c) =>
   if (!attachmentId) return jsonError(c, 400, "Invalid attachment id");
   const deleted = await deletePlannedSessionAttachmentFor(getDb(c.env.DB), c.env.ATTACHMENTS, athlete.id, attachmentId);
   if (!deleted) return jsonError(c, 404, "Attachment not found");
+  return c.json({ ok: true });
+});
+
+// Team meals (Fuel): any coach may edit or delete any meal; last write wins.
+// Writes count against the acting coach before the body is read.
+coach.get("/meals", async (c) => {
+  return c.json({ meals: await listTeamMeals(getDb(c.env.DB)) });
+});
+
+coach.post("/meals", rateLimit("team-meal-write", actingUserId), validateJson(teamMealInput), async (c) => {
+  return c.json(await createTeamMeal(getDb(c.env.DB), c.get("user"), c.req.valid("json")));
+});
+
+coach.put("/meals/:id", rateLimit("team-meal-write", actingUserId), validateJson(teamMealInput), async (c) => {
+  const id = parsePositiveInt(c.req.param("id"));
+  if (!id) return jsonError(c, 400, "Invalid meal id");
+  const meal = await updateTeamMeal(getDb(c.env.DB), id, c.get("user").id, c.req.valid("json"));
+  if (!meal) return jsonError(c, 404, "Meal not found");
+  return c.json(meal);
+});
+
+coach.delete("/meals/:id", rateLimit("team-meal-write", actingUserId), async (c) => {
+  const id = parsePositiveInt(c.req.param("id"));
+  if (!id) return jsonError(c, 400, "Invalid meal id");
+  if (!(await deleteTeamMeal(getDb(c.env.DB), id))) return jsonError(c, 404, "Meal not found");
   return c.json({ ok: true });
 });
 

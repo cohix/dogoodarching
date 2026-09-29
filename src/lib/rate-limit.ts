@@ -23,7 +23,8 @@ export type RateLimitOperation =
   | "bootstrap"
   | "invite-create"
   | "upload"
-  | "password-verify";
+  | "password-verify"
+  | "team-meal-write";
 
 export interface RateLimitRule {
   binding: RateLimitBindingName;
@@ -42,6 +43,7 @@ export const RATE_LIMIT_RULES: Readonly<Record<RateLimitOperation, RateLimitRule
   "invite-create": { binding: "RATE_LIMIT_10_PER_MIN", prefix: "invite-create", perMinute: 10 },
   upload: { binding: "RATE_LIMIT_10_PER_MIN", prefix: "upload", perMinute: 10 },
   "password-verify": { binding: "RATE_LIMIT_5_PER_MIN", prefix: "password-verify", perMinute: 5 },
+  "team-meal-write": { binding: "RATE_LIMIT_10_PER_MIN", prefix: "team-meal", perMinute: 10 },
 };
 
 export type RateLimitDecision = "allowed" | "denied" | "unavailable";
@@ -56,7 +58,7 @@ export function clientIp(c: Context<AppBindings>): string {
   return "unknown";
 }
 
-/** Subject for per-acting-user keys (uploads, invite creation, password verification). */
+/** Subject for per-acting-user keys (uploads, invite creation, team meal writes, password verification). */
 export function actingUserId(c: Context<AppBindings>): string {
   return c.get("user").id;
 }

@@ -128,7 +128,7 @@ describe("new athlete defaults", () => {
     expect(payload.cycleSummaries[0]?.weeks.every((week) => week.arrows === 0)).toBe(true);
   });
 
-  it("coaches see the same defaults for a new athlete, and get them for their own account", async () => {
+  it("coaches see the same defaults for a new athlete, and have no tracker of their own (0003 §5)", async () => {
     const { owner, coach, athlete } = await setupSquad();
 
     for (const viewer of [owner, coach]) {
@@ -137,9 +137,10 @@ describe("new athlete defaults", () => {
       expect(overview.body.state).toEqual(NOT_SET);
       expect(planOf(overview.body)).toEqual(STARTER_PLAN);
     }
-    const own = await tracker(coach, { today: TODAY });
-    expect(own.state).toEqual(NOT_SET);
-    expect(planOf(own)).toEqual(STARTER_PLAN);
+    for (const viewer of [owner, coach]) {
+      expect((await api(`/api/tracker?today=${TODAY}`, { cookie: viewer.cookie })).status).toBe(403);
+    }
+    expect(await count("program_state")).toBe(0);
   });
 
   it("the program advances with the calendar once the first week is over", async () => {
@@ -359,7 +360,7 @@ describe("starter plan and saved overrides", () => {
     expect(edited.status).toBe(200);
     expect(planOf(await tracker(athlete, { today: TODAY }))[5]).toEqual({ ...STARTER_PLAN[5], ...override, dayKey: "sat" });
     expect(planOf(await tracker(rival, { today: TODAY }))).toEqual(STARTER_PLAN);
-    expect(planOf(await tracker(coach, { today: TODAY }))).toEqual(STARTER_PLAN);
+    expect(await count("planned_session_overrides", "user_id = ?", coach.user.id)).toBe(0);
   });
 });
 

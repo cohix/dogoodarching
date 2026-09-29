@@ -11,7 +11,9 @@ export interface Migration {
   queries: string[];
 }
 
-export function migration(prefix: "0001" | "0002" | "0003" | "0004" | "0005" | "0006"): Migration {
+export type MigrationPrefix = "0001" | "0002" | "0003" | "0004" | "0005" | "0006" | "0007" | "0008";
+
+export function migration(prefix: MigrationPrefix): Migration {
   const found = env.TEST_MIGRATIONS.find((m) => m.name.startsWith(prefix));
   if (!found) throw new Error(`migration ${prefix}_*.sql not found in TEST_MIGRATIONS (${env.TEST_MIGRATIONS.map((m) => m.name).join(", ")})`);
   return found;
@@ -100,14 +102,24 @@ export function user0001(id: string, username: string, role: "coach" | "athlete"
     .bind(id, username, passwordHash, role, coachId, createdAt);
 }
 
+const LATER_MIGRATIONS = ["0003", "0004", "0005", "0006", "0007", "0008"] as const;
+
 /**
- * Applies every migration after 0002 (0003 drop rate_limits, 0004 lifecycle).
- * The Worker's queries expect the full schema (e.g. `users.deactivated_at`),
- * so tests that call the API after replaying 0002 by hand run this first.
+ * Applies every migration after 0002 (0003 drop rate_limits, 0004 lifecycle,
+ * …, 0007 team meals, 0008 coach data removal), or only those up to and
+ * including `through`. The Worker's queries expect the full schema (e.g.
+ * `users.deactivated_at`, `team_meals`), so tests that call the API after
+ * replaying 0002 by hand run this first.
  */
-export async function applyLaterMigrations(): Promise<void> {
-  await applyMigration(migration("0003"));
-  await applyMigration(migration("0004"));
-  await applyMigration(migration("0005"));
-  await applyMigration(migration("0006"));
+export async function applyLaterMigrations(through: (typeof LATER_MIGRATIONS)[number] = "0008"): Promise<void> {
+  for (const prefix of LATER_MIGRATIONS.slice(0, LATER_MIGRATIONS.indexOf(through) + 1)) {
+    await applyMigration(migration(prefix));
+  }
+}
+
+/** Empty database at the schema just before `prefix` (e.g. "0008" → through 0007). */
+export async function rewindToBefore(prefix: "0007" | "0008"): Promise<void> {
+  await rewindTo0001();
+  await applyMigration(migration("0002"));
+  await applyLaterMigrations(prefix === "0008" ? "0007" : "0006");
 }

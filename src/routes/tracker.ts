@@ -1,11 +1,14 @@
 // Personal tracker endpoints: every handler operates on the caller's own data.
+// Athletes only (`requireAthlete`, 0003 §5): coaches have no personal tracker
+// and get 403. The one exception is the attachment download, which also
+// serves coaches opening athlete plan files (owner-or-coach check inside).
 
 import { Hono } from "hono";
 import { getDb } from "../db";
 import { actingUserId, rateLimit } from "../lib/rate-limit";
 import { dateKeyUtc } from "../lib/dates";
 import { jsonError, parsePositiveInt, validateJson, validateQuery } from "../lib/http";
-import { authMiddleware, type AppBindings } from "../lib/rbac";
+import { authMiddleware, requireAthlete, type AppBindings } from "../lib/rbac";
 import {
   adjustInput, checkInput, cycleWeekPlanInput, duplicateSetupInput, inspirationInput, maintenanceItemCheckInput,
   maintenanceItemInput, maintenanceItemLabelInput, maintenanceSectionInput, plannedSessionInput,
@@ -26,20 +29,20 @@ const tracker = new Hono<AppBindings>();
 
 tracker.use("*", authMiddleware);
 
-tracker.get("/tracker", validateQuery(trackerQuery), async (c) => {
+tracker.get("/tracker", requireAthlete, validateQuery(trackerQuery), async (c) => {
   const today = c.req.valid("query").today ?? dateKeyUtc(new Date());
   return c.json(await getTrackerPayload(getDb(c.env.DB), c.get("user").id, today, c.req.valid("query").before));
 });
 
-tracker.post("/notes/weekly", validateJson(weeklyNoteInput), async (c) => {
+tracker.post("/notes/weekly", requireAthlete, validateJson(weeklyNoteInput), async (c) => {
   return c.json(await saveWeeklyNoteFor(getDb(c.env.DB), c.get("user").id, c.req.valid("json")));
 });
 
-tracker.post("/sessions", validateJson(sessionInput), async (c) => {
+tracker.post("/sessions", requireAthlete, validateJson(sessionInput), async (c) => {
   return c.json(await addSessionFor(getDb(c.env.DB), c.get("user").id, c.req.valid("json")));
 });
 
-tracker.put("/sessions/:id", validateJson(sessionInput), async (c) => {
+tracker.put("/sessions/:id", requireAthlete, validateJson(sessionInput), async (c) => {
   const id = parsePositiveInt(c.req.param("id"));
   if (!id) return jsonError(c, 400, "Invalid session id");
   const result = await updateSessionFor(getDb(c.env.DB), c.get("user").id, id, c.req.valid("json"));
@@ -47,7 +50,7 @@ tracker.put("/sessions/:id", validateJson(sessionInput), async (c) => {
   return c.json(result);
 });
 
-tracker.delete("/sessions/:id", async (c) => {
+tracker.delete("/sessions/:id", requireAthlete, async (c) => {
   const id = parsePositiveInt(c.req.param("id"));
   if (!id) return jsonError(c, 400, "Invalid session id");
   const result = await deleteSessionFor(getDb(c.env.DB), c.get("user").id, id);
@@ -55,11 +58,11 @@ tracker.delete("/sessions/:id", async (c) => {
   return c.json(result);
 });
 
-tracker.post("/scores", validateJson(practiceScoreInput), async (c) => {
+tracker.post("/scores", requireAthlete, validateJson(practiceScoreInput), async (c) => {
   return c.json(await addPracticeScoreFor(getDb(c.env.DB), c.get("user").id, c.req.valid("json")));
 });
 
-tracker.delete("/scores/:id", async (c) => {
+tracker.delete("/scores/:id", requireAthlete, async (c) => {
   const id = parsePositiveInt(c.req.param("id"));
   if (!id) return jsonError(c, 400, "Invalid score id");
   const result = await deletePracticeScoreFor(getDb(c.env.DB), c.get("user").id, id);
@@ -67,19 +70,19 @@ tracker.delete("/scores/:id", async (c) => {
   return c.json(result);
 });
 
-tracker.post("/plan/sessions", validateJson(plannedSessionInput), async (c) => {
+tracker.post("/plan/sessions", requireAthlete, validateJson(plannedSessionInput), async (c) => {
   return c.json(await savePlannedSessionFor(getDb(c.env.DB), c.get("user").id, c.req.valid("json")));
 });
 
-tracker.post("/plan/sessions/links", validateJson(plannedSessionLinkInput), async (c) => {
+tracker.post("/plan/sessions/links", requireAthlete, validateJson(plannedSessionLinkInput), async (c) => {
   return c.json(await addPlannedSessionLinkFor(getDb(c.env.DB), c.get("user").id, c.req.valid("json")));
 });
 
-tracker.post("/plan/sessions/files", rateLimit("upload", actingUserId), async (c) => {
+tracker.post("/plan/sessions/files", requireAthlete, rateLimit("upload", actingUserId), async (c) => {
   return c.json(await uploadPlannedSessionFileFor(getDb(c.env.DB), c.env.ATTACHMENTS, c.get("user").id, c.get("user").id, c.req.raw));
 });
 
-tracker.delete("/plan/attachments/:id", async (c) => {
+tracker.delete("/plan/attachments/:id", requireAthlete, async (c) => {
   const id = parsePositiveInt(c.req.param("id"));
   if (!id) return jsonError(c, 400, "Invalid attachment id");
   const deleted = await deletePlannedSessionAttachmentFor(getDb(c.env.DB), c.env.ATTACHMENTS, c.get("user").id, id);
@@ -95,27 +98,27 @@ tracker.get("/plan/attachments/:id/file", async (c) => {
   return new Response(file.object.body, { headers: fileDownloadHeaders(file.attachment, file.object) });
 });
 
-tracker.post("/plan/weeks", validateJson(cycleWeekPlanInput), async (c) => {
+tracker.post("/plan/weeks", requireAthlete, validateJson(cycleWeekPlanInput), async (c) => {
   return c.json(await saveCycleWeekPlanFor(getDb(c.env.DB), c.get("user").id, c.req.valid("json")));
 });
 
-tracker.post("/plan/adjust", validateJson(adjustInput), async (c) => {
+tracker.post("/plan/adjust", requireAthlete, validateJson(adjustInput), async (c) => {
   return c.json(await adjustScheduleFor(getDb(c.env.DB), c.get("user").id, c.req.valid("json")));
 });
 
-tracker.post("/plan/poundage", validateJson(poundageInput), async (c) => {
+tracker.post("/plan/poundage", requireAthlete, validateJson(poundageInput), async (c) => {
   return c.json(await savePoundageFor(getDb(c.env.DB), c.get("user").id, c.req.valid("json").poundage, c.req.valid("json").today));
 });
 
-tracker.post("/checks", validateJson(checkInput), async (c) => {
+tracker.post("/checks", requireAthlete, validateJson(checkInput), async (c) => {
   return c.json(await setCheckFor(getDb(c.env.DB), c.get("user").id, c.req.valid("json")));
 });
 
-tracker.post("/maintenance/items", validateJson(maintenanceItemInput), async (c) => {
+tracker.post("/maintenance/items", requireAthlete, validateJson(maintenanceItemInput), async (c) => {
   return c.json(await addMaintenanceItemFor(getDb(c.env.DB), c.get("user").id, c.req.valid("json")));
 });
 
-tracker.put("/maintenance/items/:id", validateJson(maintenanceItemLabelInput), async (c) => {
+tracker.put("/maintenance/items/:id", requireAthlete, validateJson(maintenanceItemLabelInput), async (c) => {
   const id = parsePositiveInt(c.req.param("id"));
   if (!id) return jsonError(c, 400, "Invalid item id");
   const result = await updateMaintenanceItemFor(getDb(c.env.DB), c.get("user").id, id, c.req.valid("json").label);
@@ -123,7 +126,7 @@ tracker.put("/maintenance/items/:id", validateJson(maintenanceItemLabelInput), a
   return c.json(result);
 });
 
-tracker.delete("/maintenance/items/:id", async (c) => {
+tracker.delete("/maintenance/items/:id", requireAthlete, async (c) => {
   const id = parsePositiveInt(c.req.param("id"));
   if (!id) return jsonError(c, 400, "Invalid item id");
   const result = await deleteMaintenanceItemFor(getDb(c.env.DB), c.get("user").id, id);
@@ -131,23 +134,23 @@ tracker.delete("/maintenance/items/:id", async (c) => {
   return c.json(result);
 });
 
-tracker.post("/maintenance/items/:id/check", validateJson(maintenanceItemCheckInput), async (c) => {
+tracker.post("/maintenance/items/:id/check", requireAthlete, validateJson(maintenanceItemCheckInput), async (c) => {
   const id = parsePositiveInt(c.req.param("id"));
   if (!id) return jsonError(c, 400, "Invalid item id");
   return c.json(await setMaintenanceItemCheckedFor(getDb(c.env.DB), c.get("user").id, id, c.req.valid("json").checked));
 });
 
-tracker.post("/maintenance/sections/clear", validateJson(maintenanceSectionInput), async (c) => {
+tracker.post("/maintenance/sections/clear", requireAthlete, validateJson(maintenanceSectionInput), async (c) => {
   return c.json(await clearMaintenanceSectionFor(getDb(c.env.DB), c.get("user").id, c.req.valid("json").section));
 });
 
-tracker.post("/setups", validateJson(setupInput), async (c) => {
+tracker.post("/setups", requireAthlete, validateJson(setupInput), async (c) => {
   const result = await saveSetupFor(getDb(c.env.DB), c.get("user").id, c.req.valid("json"));
   if (!result) return jsonError(c, 404, "Setup not found");
   return c.json(result);
 });
 
-tracker.post("/setups/:id/duplicate", validateJson(duplicateSetupInput), async (c) => {
+tracker.post("/setups/:id/duplicate", requireAthlete, validateJson(duplicateSetupInput), async (c) => {
   const id = parsePositiveInt(c.req.param("id"));
   if (!id) return jsonError(c, 400, "Invalid setup id");
   const result = await duplicateSetupFor(getDb(c.env.DB), c.get("user").id, id, c.req.valid("json").poundage);
@@ -155,7 +158,7 @@ tracker.post("/setups/:id/duplicate", validateJson(duplicateSetupInput), async (
   return c.json(result);
 });
 
-tracker.post("/inspiration", validateJson(inspirationInput), async (c) => {
+tracker.post("/inspiration", requireAthlete, validateJson(inspirationInput), async (c) => {
   return c.json(await addInspirationFor(getDb(c.env.DB), c.get("user").id, c.req.valid("json")));
 });
 

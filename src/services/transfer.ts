@@ -1,4 +1,5 @@
-// Export / import of one account's data (both roles).
+// Export / import of one athlete account's data (coaches get 403 at the route).
+// Team meals are team data: never exported, created or deleted here.
 //
 // Export produces the version-1 JSON document. LIMITATION: file attachments
 // (kind "document" | "photo") are EXCLUDED from the export — their blob bytes

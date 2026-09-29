@@ -55,6 +55,17 @@ export const requireCoach = createMiddleware<AppBindings>(async (c, next) => {
   await next();
 });
 
+/**
+ * Requires the authenticated user to be an athlete; otherwise 403. Coaches
+ * have no personal training data (0003 §5), so personal tracker routes and
+ * export/import reject them. Coach writes into athlete plans use the coach
+ * routes, which store under the athlete's id.
+ */
+export const requireAthlete = createMiddleware<AppBindings>(async (c, next) => {
+  if (c.get("user").role !== "athlete") return c.json({ error: "Forbidden" }, 403);
+  await next();
+});
+
 /** Loads an athlete in the deployment-wide team; coach routes enforce requireCoach. */
 export async function resolveAthlete(c: Context<AppBindings>, athleteId: string): Promise<AuthUser | null> {
   const db = getDb(c.env.DB);

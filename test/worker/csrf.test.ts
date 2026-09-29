@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { sameOriginGuard, validateJson } from "../../src/lib/http";
 import type { AppBindings } from "../../src/lib/rbac";
-import { api, bootstrapCoach, DEFAULT_PASSWORD, type RequestOptions } from "./helpers";
+import { api, bootstrapCoach, bootstrapTeam, DEFAULT_PASSWORD, type RequestOptions } from "./helpers";
 
 const credentials = { username: "csrf-owner", password: DEFAULT_PASSWORD };
 
@@ -15,6 +15,10 @@ describe("unsafe API requests require same-origin proof for every body type", ()
     ["/api/auth/invites/unused", { method: "DELETE" }],
     ["/api/unknown", { method: "PATCH" }],
     ["/api/unknown", { method: "PUT" }],
+    // Team meal writes (0003 §3).
+    ["/api/coach/meals", { json: { name: "n", summary: "s", ingredients: "i", instructions: "m" } }],
+    ["/api/coach/meals/1", { method: "PUT", json: { name: "n", summary: "s", ingredients: "i", instructions: "m" } }],
+    ["/api/coach/meals/1", { method: "DELETE" }],
   ];
 
   it.each(["https://attacker.test", "http://sibling.example.com", "null", "http://example.com:8080", "https://example.com"])("rejects Origin %j even with same-origin Fetch Metadata", async (origin) => {
@@ -118,8 +122,9 @@ describe("JSON content type validation", () => {
 });
 
 it("missing Origin with same-origin metadata reaches an authenticated raw upload and bodyless DELETE", async () => {
-  const owner = await bootstrapCoach();
-  const proof = { origin: null, headers: { "sec-fetch-site": "same-origin" }, cookie: owner.cookie };
+  // Personal uploads are athlete-only (0003 §5).
+  const { athlete } = await bootstrapTeam();
+  const proof = { origin: null, headers: { "sec-fetch-site": "same-origin" }, cookie: athlete.cookie };
   const upload = await api("/api/plan/sessions/files?dayKey=mon&kind=document&label=CSRF", {
     ...proof, method: "POST", headers: { ...proof.headers, "content-type": "application/pdf" },
     body: new File([new Uint8Array([1,2,3])], "csrf.pdf", { type: "application/pdf" }),

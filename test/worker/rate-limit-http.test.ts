@@ -1,7 +1,7 @@
 import { env } from "cloudflare:test";
 import { afterEach, expect, it } from "vitest";
 import type { RateLimitBinding } from "../../src/db";
-import { api, bootstrapCoach, bootstrapTeam, createInvite, DEFAULT_PASSWORD, uploadFile } from "./helpers";
+import { api, bootstrapCoach, bootstrapTeam, createInvite, DEFAULT_PASSWORD, sessionCookie, uploadFile, type Session } from "./helpers";
 
 const originalFive = env.RATE_LIMIT_5_PER_MIN;
 const originalTen = env.RATE_LIMIT_10_PER_MIN;
@@ -38,15 +38,17 @@ it("routes select 5/min for bootstrap and password checks; 10/min for invites an
   const token = await createInvite(owner);
   const accepted = await api("/api/auth/accept-invite", { json: { token, username: "athlete", password: DEFAULT_PASSWORD } });
   expect(accepted.status).toBe(201);
-  const athlete = await accepted.json() as { id: string };
-  expect((await uploadFile(`/api/coach/athletes/${athlete.id}/plan/sessions/files`, owner)).status).toBe(200);
-  expect((await uploadFile("/api/plan/sessions/files", owner)).status).toBe(200);
+  const athlete = { cookie: sessionCookie(accepted), user: await accepted.json() as Session["user"] };
+  expect((await uploadFile(`/api/coach/athletes/${athlete.user.id}/plan/sessions/files`, owner)).status).toBe(200);
+  // Personal uploads are athlete-only (0003 §5): a coach is refused before the limiter runs.
+  expect((await uploadFile("/api/plan/sessions/files", owner)).status).toBe(403);
+  expect((await uploadFile("/api/plan/sessions/files", athlete)).status).toBe(200);
   expect((await api("/api/auth/password", { cookie: owner.cookie, json: { currentPassword: "incorrect", newPassword: "new-password" } })).status).toBe(400);
   expect((await api("/api/auth/account", { method: "DELETE", cookie: owner.cookie, json: { password: "incorrect" } })).status).toBe(400);
   expect((await api("/api/auth/owner/transfer", { cookie: owner.cookie, json: { coachId: "unknown", password: "incorrect" } })).status).toBe(400);
   expect(calls).toEqual([
     [5,"bootstrap:unknown"], [10,`invite-create:${owner.user.id}`], [10,"accept-invite:unknown"],
-    [10,`upload:${owner.user.id}`], [10,`upload:${owner.user.id}`],
+    [10,`upload:${owner.user.id}`], [10,`upload:${athlete.user.id}`],
     [5,`password-verify:${owner.user.id}`], [5,`password-verify:${owner.user.id}`], [5,`password-verify:${owner.user.id}`],
   ]);
 });

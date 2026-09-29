@@ -1,0 +1,103 @@
+{
+  "schema_version": 4,
+  "invocation_id": "4f4d00e5-de95-4ded-b946-3388b489f343",
+  "workflow_name": "0003: Coach Today, coach navigation, team Fuel meals and athlete detail layout",
+  "workflow_hash": "a67b98435914893b6edda6a61db588c56e6db4fe4e255bf8b0b196d153df8cf4",
+  "work_item": 3,
+  "step_states": {
+    "worker-tests": "Succeeded",
+    "docs": "Succeeded",
+    "review": "Skipped",
+    "frontend-tests": "Succeeded",
+    "frontend": "Succeeded",
+    "server": "Succeeded"
+  },
+  "completed_steps": [
+    "frontend",
+    "server",
+    "review",
+    "frontend-tests",
+    "worker-tests",
+    "docs"
+  ],
+  "current_step_index": null,
+  "started_at": "2026-09-29T14:15:08.535944Z",
+  "updated_at": "2026-09-29T15:28:57.356760Z",
+  "steps": [
+    {
+      "name": "server",
+      "depends_on": []
+    },
+    {
+      "name": "frontend",
+      "depends_on": []
+    },
+    {
+      "name": "worker-tests",
+      "depends_on": [
+        "server"
+      ]
+    },
+    {
+      "name": "frontend-tests",
+      "depends_on": [
+        "frontend"
+      ]
+    },
+    {
+      "name": "docs",
+      "depends_on": [
+        "server",
+        "frontend"
+      ]
+    },
+    {
+      "name": "review",
+      "depends_on": [
+        "worker-tests",
+        "frontend-tests",
+        "docs"
+      ],
+      "agent": "codex"
+    }
+  ],
+  "current_phase": "Done",
+  "setup_completed": true,
+  "teardown_completed": true,
+  "setup_step_states": [
+    {
+      "description": "run_shell: npm ci",
+      "status": "Succeeded"
+    }
+  ],
+  "teardown_step_states": [
+    {
+      "description": "run_shell: npm run typecheck && npm run lint && npm run docs:check && npm run db:check && npm test && npm run build",
+      "status": "Succeeded"
+    },
+    {
+      "description": "commit_changes: Implement 0003: coach Today, coach navigation, team Fuel meals and athlete detail layout",
+      "status": {
+        "Failed": {
+          "error": "Author identity unknown\n\n*** Please tell me who you are.\n\nRun\n\n  git config --global user.email \"you@example.com\"\n  git config --global user.name \"Your Name\"\n\nto set your account's default identity.\nOmit --global to set the identity only in this repository.\n\nfatal: unable to auto-detect email address (got 'root@awman-7042-731572000.(none)')\n"
+        }
+      }
+    },
+    {
+      "description": "push_branch",
+      "status": {
+        "Failed": {
+          "error": "fatal: The current branch awman/work-item-0003 has no upstream branch.\nTo push the current branch and set the remote as upstream, use\n\n    git push --set-upstream origin awman/work-item-0003\n\nTo have this happen automatically for branches without a tracking\nupstream, see 'push.autoSetupRemote' in 'git help config'.\n\n"
+        }
+      }
+    },
+    {
+      "description": "create_pull_request: Work item 0003: coach experience",
+      "status": {
+        "Failed": {
+          "error": "sh: 1: gh: not found\n"
+        }
+      }
+    }
+  ]
+}

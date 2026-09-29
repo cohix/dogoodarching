@@ -122,14 +122,17 @@ describe.each(mutations)("$name", (mutation) => {
     expect(await tableCounts()).toEqual(countsBefore);
   });
 
-  it("returns 404 when a coach aims the athlete route at an athlete's id", async () => {
+  it("returns 403 when a coach aims the athlete-only route at an athlete's id (0003 §5)", async () => {
     const { owner, coach, athlete } = await setupSquad();
     const id = await mutation.create(athlete);
     const before = await mutation.snapshot(id);
     const countsBefore = await tableCounts();
 
-    await expectNotFound(await send(mutation.call(id), owner), mutation.error);
-    await expectNotFound(await send(mutation.call(id), coach), mutation.error);
+    for (const session of [owner, coach]) {
+      const response = await send(mutation.call(id), session);
+      expect(response.status).toBe(403);
+      expect(await response.json()).toEqual({ error: "Forbidden" });
+    }
 
     expect(await mutation.snapshot(id)).toEqual(before);
     expect(await tableCounts()).toEqual(countsBefore);

@@ -5,7 +5,7 @@
  */
 import { uploadFile } from "./helpers";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { api, apiJson, type Session } from "./helpers";
+import { acceptInvite, api, apiJson, createInvite, type Session } from "./helpers";
 import {
   addItem, addScore, addSession, addSetup, checkItem, count, parseContentDisposition, post, rows, setupAthletes, tracker,
 } from "./tracker-fixtures";
@@ -150,11 +150,18 @@ describe("export omits entries", () => {
     for (const key of DATA_KEYS.filter((name) => name !== "programState")) expect(file.data[key], key).toEqual([]);
   });
 
-  it("coaches can export their own account, also without entries", async () => {
-    const { owner } = await setupAthletes();
-    const file = await exportFor(owner);
-    expect(file.username).toBe("owner");
-    expect(Object.keys(file.data).sort()).toEqual(DATA_KEYS);
+  it("coaches have no personal data, so export and import are 403 for them (0003 §5)", async () => {
+    const { owner, athlete } = await setupAthletes();
+    await addSession(athlete, { notes: "athlete row" });
+    const source = await exportFor(athlete);
+    expect(Object.keys(source.data).sort()).toEqual(DATA_KEYS);
+    const exported = await apiJson("/api/export", { cookie: owner.cookie });
+    expect(exported.status).toBe(403);
+    expect(exported.body).toEqual({ error: "Forbidden" });
+    const imported = await importFor(owner, source);
+    expect(imported.status).toBe(403);
+    expect(await count("training_sessions", "user_id = ?", owner.user.id)).toBe(0);
+    expect(await count("training_sessions")).toBe(1);
   });
 
   it("the schema has no entries table left to export", async () => {
@@ -305,11 +312,12 @@ describe("export → import round trip", () => {
 
   it("moves an account's data to another account without touching anyone else", async () => {
     const { owner, athlete, rival } = await setupAthletes();
+    const bystander = await acceptInvite(await createInvite(owner), "bystander");
     await fillAccount(athlete);
     await addSession(rival, { notes: "rival before import" });
-    await addSession(owner, { notes: "owner row" });
+    await addSession(bystander, { notes: "bystander row" });
     const source = await exportFor(athlete);
-    const ownerBefore = await exportFor(owner);
+    const bystanderBefore = await exportFor(bystander);
 
     const result = await importFor(rival, source);
 
@@ -317,7 +325,7 @@ describe("export → import round trip", () => {
     expect(withoutIds(await exportFor(rival))).toEqual(withoutIds(source));
     // The source account and the bystander are unchanged, ids included.
     expect((await exportFor(athlete)).data).toEqual(source.data);
-    expect((await exportFor(owner)).data).toEqual(ownerBefore.data);
+    expect((await exportFor(bystander)).data).toEqual(bystanderBefore.data);
     // No id of the imported copy collides with the source rows.
     expect(await count("training_sessions")).toBe(2 + 2 + 1);
     expect(await count("training_sessions", "notes = 'rival before import'")).toBe(0);

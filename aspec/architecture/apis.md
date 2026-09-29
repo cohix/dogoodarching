@@ -35,7 +35,7 @@ Authentication and common gates:
 - `dga_session` is HttpOnly, `SameSite=Strict`, `Path=/`, Secure over HTTPS, with a 30-day TTL matching the stored session. Only its SHA-256 hash is stored.
 - Status/bootstrap/login/accept-invite are public; other endpoints require a session. [Foundation](../foundation.md#personas) owns role/lifecycle policy.
 - All unsafe requests need [same-origin proof](security.md#api-security), even public, raw or bodyless requests (403). JSON endpoints require `Content-Type: application/json`, optionally a charset (415 before parsing). Malformed JSON and schema failures are 400. Bodyless endpoints need no Content-Type.
-- Every authenticated endpoint can return 401; coach/owner gates add 403. Unexpected failures can return 500. The tables below list additional operation-specific responses; JSON rows also inherit 400/415 and all unsafe rows inherit CSRF 403.
+- Every authenticated endpoint can return 401; coach/athlete/owner gates add 403. Unexpected failures can return 500. The tables below list additional operation-specific responses; JSON rows also inherit 400/415 and all unsafe rows inherit CSRF 403.
 
 Account and invitation contracts:
 
@@ -66,6 +66,15 @@ Team contracts (coach required):
 | `POST /api/coach/athletes/:athleteId/deactivate` | No body; 200 athlete summary; idempotent, revokes sessions | 404 unknown ID or coach target |
 | `POST /api/coach/athletes/:athleteId/reactivate` | No body; 200 athlete summary; idempotent | 404 unknown ID or coach target |
 | `GET /api/coach/athletes/:athleteId/overview` | 200 `{ state, weeklyPlans, plannedSessions, weeklyArrows, cycleSummaries }`; optional `today` | 400 invalid query; 404 non-athlete/missing target |
+| `GET /api/coach/overview` | 200 `{ athletes: [...] }`, active athletes only; optional `today` | 400 invalid query |
+| `GET /api/coach/meals` | 200 `{ meals: [...] }`, newest first by creation | — |
+| `POST /api/coach/meals` | JSON `{ name, summary, ingredients, instructions }`; 200 meal | 429/503 |
+| `PUT /api/coach/meals/:id` | Same JSON, full replace; 200 meal; records the acting coach as `updatedBy`, last write wins | 400 invalid ID; 404 `Meal not found`; 429/503 |
+| `DELETE /api/coach/meals/:id` | No body; 200 `{ ok: true }` | 400 invalid ID; 404 `Meal not found`; 429/503 |
+
+The team overview is ordered by username (case-insensitive, then exact). Each athlete is `{ id, username, displayName, currentPoundage, currentCycle, currentWeek, currentCycleSummary, cycleArrows, cycleSessions, averagePerWeek, averagePerSession }`. `displayName` is currently the username; `currentPoundage` is nullable. `currentCycleSummary` is `{ cycle, weeks }`, the same element as the per-athlete overview's current `cycleSummaries` entry: six weeks of `{ weekNumber, weekStart, arrows, dayStatuses }`, each with six Monday–Saturday `completed`/`skipped`/`upcoming` statuses. `cycleArrows` and `cycleSessions` cover the current cycle's six weeks; `averagePerWeek` is `cycleArrows ÷ max(currentWeek, 1)` and `averagePerSession` is `cycleArrows ÷ cycleSessions`, or null with no sessions. Numbers are unrounded. Athletes without program state get the default cycle 1/week 1 and null poundage.
+
+A meal is `{ id, name, summary, ingredients, instructions, author, updatedBy, createdAt, updatedAt }` with ISO instants. `author` and `updatedBy` are usernames, never user IDs; a deleted account shows as `Coach`, and `updatedBy` is null for a never-edited meal. Any coach may edit or delete any meal. Fields use the shared recipe rules: required, non-empty, at most 200/1,500/3,000/6,000 characters. Meal writes share the `team-meal` rate limit, checked before body validation.
 
 Athlete summaries always include `{ id, username, createdAt, deactivatedAt }`; the last field is an ISO instant or null. Deactivated athletes retain coach plan/overview access. Deactivation repeated twice preserves its original timestamp. Coach plan edits retain `PUT /plan/sessions`, `PUT /plan/weeks`, `POST /plan/adjust`, `POST /plan/sessions/links` and `DELETE /plan/attachments/:attachmentId` under `/api/coach/athletes/:athleteId`; success is 200, invalid input is 400, missing targets/attachments are 404.
 
@@ -73,24 +82,27 @@ Upload transport:
 
 | Method and path | Success | Additional failures |
 |---|---|---|
-| `POST /api/plan/sessions/files` | Either role, own quota; 200 `{ id }` | 400/401/413/415/429/500/503 |
+| `POST /api/plan/sessions/files` | Athlete, own quota; 200 `{ id }` | 400/401/403/413/415/429/500/503 |
 | `POST /api/coach/athletes/:athleteId/plan/sessions/files` | Coach, athlete quota; 200 `{ id }` | 400/401/403/404/413/415/429/500/503 |
 
 Both send the original file as the raw body, with query parameters `dayKey` (mon–sun), `kind` (`document` or `photo`) and `label` (trimmed 1–160 characters). `Content-Type` is the actual file MIME; see the [exact allowlist and quotas](security.md#file-attachments). There is no JSON/base64 or multipart envelope. The browser client uses `body: file`, includes credentials and sends `X-File-Size: file.size`; it never sets Content-Length or Origin itself.
 
 A declared oversize length is rejected before reading. Content-Length or X-File-Size is required; if both are present they must agree. A counted FixedLengthStream pipes directly to R2 with backpressure and checks actual bytes and exact length at EOF. Invalid length syntax, empty body, truncated/mismatched length and expired/revoked commit eligibility return 400. Size/quota/accounting failures are 413 with messages identifying 8 MB, 100 files, 500 MB, or incomplete accounting. MIME failure is 415 `Unsupported file type`; unexpected service failure is 500 `Upload failed`. Middleware runs before upload validation, so its first failing gate determines the response.
 
-`GET /api/plan/attachments/:id/file` is the shared download route for both roles: 200 bytes, 400 malformed ID, 404 inaccessible/missing file. Personal `DELETE /api/plan/attachments/:id` and coach deletion above return 200 `{ ok: true }`, 400 invalid ID or 404 missing attachment; durable cleanup runs after D1 removal.
+`GET /api/plan/attachments/:id/file` is the shared download route for both roles and is not athlete-gated: 200 bytes, 400 malformed ID, 404 inaccessible/missing file. Personal `DELETE /api/plan/attachments/:id` and coach deletion above return 200 `{ ok: true }`, 400 invalid ID or 404 missing attachment; durable cleanup runs after D1 removal.
 
 Import/export:
 
-- `GET /api/export`: 200 JSON download containing only the caller's data and link attachments. File bytes are excluded.
+- Export and import are athlete-only; coaches receive 403.
+- `GET /api/export`: 200 JSON download containing only the caller's data and link attachments. File bytes and team meals are excluded; import never creates team meals.
 - `POST /api/import`: JSON version-1 payload, 200 `{ ok: true, counts }`; invalid fields/relationships are indexed 400 errors, oversize requests/batches are 413, inactive actors are 401, wrong media type is 415 and unexpected database failure is 500; post-commit storage failure retains successful import with durable cleanup. `programState: null`, null poundage and ignored legacy `entries` remain compatible; all required empty arrays plus null state clear personal data. `{}` is invalid.
 - Import accepts at most 8,000,000 UTF-8 request bytes, 20,000 sessions, 5,000 scores, 50,000 ends, six week plans, seven day overrides, 1,000 setups and 5,000 rows in each other array. Every field uses the normal write validators; dates must exist, links must be HTTP(S), sight marks must be an object of strings, and scores must contain ten unique ends with consistent totals. Duplicate IDs/keys and orphan relationships return indexed 400 errors. Program cycles and elapsed-time advancement are capped at 200 cycles.
 - The complete replacement must fit 40 D1 statements, including guards, cleanup enqueue and mapping removal. JSON row chunks contain at most 1,000 rows and 128,000 UTF-8 bytes; each statement is preflighted for 100 bound parameters, 100,000 SQL bytes and 128,000 bytes per bound string. This deliberately fits the Free plan’s 50-query invocation budget, including authentication and one prompt blob-cleanup attempt, and also works on Paid. Effective capacity depends on row widths and populated collections: the row caps are ceilings, not a promise that every combination fits. Oversize requests/batches return 413 before any destructive write. The operation is never split across committed batches. See [transfer design](design.md#component-6) for atomic parent mapping and post-commit cleanup. No staging/mapping endpoint exists.
 
 Other conventions:
 
+- Personal tracker routes are athlete-only (`requireAthlete`); coaches receive 403 `{ error: "Forbidden" }`. This covers `GET /api/tracker`, sessions, scores, weekly notes, personal plan/poundage/adjust writes, personal plan links, uploads and attachment deletion, checks, maintenance, setups and `POST /api/inspiration`, plus export/import. The file download, `/api/auth/*` and `/api/coach/*` routes are not athlete-gated; coach plan writes are stored under the athlete.
+- Tracker `recipes[]` merges the athlete's own check-in recipes with every team meal, newest first (own rows by update time, team rows by creation time). Each item has `key` (`own:<id>` or `team:<id>`, since the ID spaces collide), `source` (`own`/`team`), `id`, the four recipe fields, `author` (null for own rows; a username or `Coach` for team rows) and `updatedAt`. `inspiration` remains the athlete's newest own check-in.
 - Updates/deletes of sessions, scores, maintenance items and existing setups return 404 for no match; plan/check/note upserts create missing state.
 - `GET /api/tracker?today=YYYY-MM-DD&before=YYYY-MM-DD,id` returns at most 100 sessions, descending by date then ID, with the exclusive cursor taken from the last row. Other collections do not paginate. No separate next-cursor field exists.
 - Initial poundage sends `{ poundage, today }`; omitted `today` uses server UTC and existing anchors are preserved.

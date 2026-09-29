@@ -1,17 +1,15 @@
 import { type CycleSummary } from "../../api";
 import { formatAverage } from "../../lib/format";
-import { statusColor } from "./trainingStatus";
+import { CycleWeeksGrid } from "./CycleWeeksGrid";
 import { type Tracker } from "../../lib/types";
 import { useEscapeToClose } from "../../components/useEscapeToClose";
 
-export function CycleSummaryCard({ summary }: { summary: CycleSummary }) {
+export function CycleSummaryCard({ summary, currentWeek = 6 }: { summary: CycleSummary; currentWeek?: number }) {
   const total = summary.weeks.reduce((sum, week) => sum + week.arrows, 0);
-  const average = total / 6;
+  const average = total / Math.max(currentWeek, 1);
   return <section className="card p-4" aria-label={`Cycle ${summary.cycle}: ${total} arrows total, ${formatAverage(average)} average arrows per week`}>
     <h3 className="text-sm font-extrabold">Cycle {summary.cycle}</h3>
-    <div className="mt-3 grid grid-cols-6 gap-2" role="img" aria-label={summary.weeks.map((week) => `Week ${week.weekNumber}: ${week.arrows} arrows`).join(", ")}>
-      {summary.weeks.map((week) => <div key={week.weekNumber} className="min-w-0"><div className="flex gap-[2px]">{week.dayStatuses.map((status, dayIndex) => <span key={dayIndex} className="h-1.5 min-w-0 flex-1 rounded-full" style={{ backgroundColor: statusColor[status] }} />)}</div><p className="mt-1.5 whitespace-nowrap text-center text-[9px] font-bold text-[var(--dim)]">W{week.weekNumber} ({week.arrows})</p></div>)}
-    </div>
+    <CycleWeeksGrid weeks={summary.weeks} className="mt-3" label={summary.weeks.map((week) => `Week ${week.weekNumber}: ${week.arrows} arrows`).join(", ")} />
     <div className="mt-4 grid grid-cols-2 divide-x divide-[var(--border)] border-t border-[var(--border)] pt-3 text-center"><div><p className="text-xl font-extrabold">{total}</p><p className="text-[10px] font-bold uppercase tracking-[.06em] text-[var(--dim)]">Total arrows</p></div><div><p className="text-xl font-extrabold">{formatAverage(average)}</p><p className="text-[10px] font-bold uppercase tracking-[.06em] text-[var(--dim)]">Average / week</p></div></div>
   </section>;
 }

@@ -21,18 +21,20 @@ Desktop vs mobile:
 
 Layout:
 
-- `App.tsx` gates invite acceptance and authentication, then mounts feature tabs with a shared title/header and bottom navigation. Today shows cycle progress, plan and training summaries; the other headers show poundage or its unset state. [Experience](experience.md#regular-usage) owns initial-state and starter-plan behavior.
+- `App.tsx` gates invite acceptance and authentication, then mounts the athlete or coach shell; both share one title/header and bottom navigation. The header shows no poundage for either role: athlete Today has a History action and all other tabs, including every coach tab, have none. Poundage appears only in content (athlete Today prompt, Gear setups, coach Today cards and the Team athlete header). [Experience](experience.md#regular-usage) owns initial-state and starter-plan behavior.
+- Athlete Today shows cycle progress, plan and training summaries. Coach Today lists one card per active athlete with name, cycle/week, poundage or its unset state, the shared six-week grid, cycle arrows, average per week and average per session (“—” before any session). Tapping a card opens that athlete in Team.
 - Editing sessions, scores and planned days uses overlays/modals. Mutations refresh queries, with specific missing-record recovery described in [SPA design](../architecture/design.md#component-9). History can load older sessions using the [API cursor](../architecture/apis.md#design).
 
 Menus:
 
 - `components/navigation.ts` defines `athleteNav`: **Today, Log, Plan, Gear, Fuel, Settings**.
-- `coachNav` adds **Team** before Settings; owners use this same navigation with owner-only team controls. The personal tabs continue to show the coach's own data.
-- The Team tab contains invitation management and athlete selection, with the selected athlete's plan/summary editor. Permissions are defined in [foundation](../foundation.md#personas).
+- `coachNav` is **Today, Fuel, Team, Settings**; owners use this same navigation with owner-only team controls. Coaches have no personal tracker: the coach shell never loads `/api/tracker` or mounts athlete Today, Log, Plan or Gear, and any other tab id falls back to coach Today.
+- Coach Fuel has an add/edit meal form (name, summary, ingredients, method) above the team meal list; each card offers Edit, which prefills the form, and Delete with confirmation. Athlete Fuel lists own check-in meals and team meals newest first, labelling team meals “From your coach”.
+- The Team tab contains invitation management and athlete selection. The selected athlete's detail shows the back link, athlete header, current cycle summary, arrows summary (opening the full history) with an inline arrows-by-week chart, the plan editor and then earlier cycles. The current cycle's weekly average divides arrows by the current week, matching Today; completed cycles divide by six. “Back to team” returns to the roster, even when the athlete was opened from coach Today. Permissions are defined in [foundation](../foundation.md#personas).
 
 Empty states:
 
-- `components/Empty.tsx` renders a centered, muted text message inside the standard padded card. Features provide relevant no-data text; loading and network errors have their own messages/retry actions. Team's empty roster prompts creation of an athlete invite.
+- `components/Empty.tsx` renders a centered, muted text message inside the standard padded card. Features provide relevant no-data text; loading and network errors have their own messages/retry actions. Team's empty roster prompts creation of an athlete invite; coach Today's empty list points to Team to invite one.
 
 Accessibility:
 
@@ -41,7 +43,7 @@ Accessibility:
 
 Machine use:
 
-- Settings exports/imports version-1 JSON via `services/transfer.ts`: `{ version: 1, exportedAt, username, data }`. Import requires `version` and `data`; the export's metadata does not choose the destination user, which is always the authenticated account.
+- Athlete Settings exports/imports version-1 JSON (coaches have no export/import) via `services/transfer.ts`: `{ version: 1, exportedAt, username, data }`. Import requires `version` and `data`; the export's metadata does not choose the destination user, which is always the authenticated account.
 - `data` contains `trainingSessions`, `practiceScores`, `practiceScoreEnds`, `programState` (object or null), `cycleWeekPlans`, `plannedSessionOverrides`, `plannedSessionAttachments`, `milestoneChecks`, `maintenanceChecks`, `maintenanceItems`, `inspirationEntries`, `weeklyNotes` and `bowSetups`. These correspond to the [data model](../architecture/design.md#data-model-summary); IDs relate parents/children and can change on import.
-- Export includes link attachments, not document/photo bytes or their file rows; it excludes authentication data and the removed `entries` table. Legacy `entries` keys are accepted and ignored. Import replaces all of the caller's tracker data after validation, with an explicit UI confirmation. Current failure/validation limits and planned hardening are in [transfer design](../architecture/design.md#component-6) and [security](../architecture/security.md#input-validation).
+- Export includes link attachments, not document/photo bytes or their file rows; it excludes authentication data, team meals and the removed `entries` table. Legacy `entries` keys are accepted and ignored. Import replaces all of the caller's tracker data after validation, with an explicit UI confirmation. Current failure/validation limits and planned hardening are in [transfer design](../architecture/design.md#component-6) and [security](../architecture/security.md#input-validation).
 - API date/time encodings are defined in [API objects](../architecture/apis.md#design). There is no machine-facing CLI or separate third-party client contract.

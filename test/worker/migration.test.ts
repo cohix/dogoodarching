@@ -108,13 +108,19 @@ describe("migrations on an empty database", () => {
     expect(await userTables()).toContain("blob_cleanup");
     await applyMigration(migration("0005"));
     await applyMigration(migration("0006"));
+    expect(await userTables()).not.toContain("team_meals"); // added by 0007
+    await applyMigration(migration("0007"));
+    expect(await userTables()).toContain("team_meals");
+    await applyMigration(migration("0008")); // data only: no schema change
     expect((await dump()).results).toEqual(fromHarness);
   });
 
-  it("only the six known migrations exist and all are applied by the harness", async () => {
-    expect(env.TEST_MIGRATIONS.map((m) => m.name)).toEqual(["0001_init.sql", "0002_team_auth.sql", "0003_drop_rate_limits.sql", "0004_lifecycle.sql", "0005_upload_accounting.sql", "0006_import_mapping.sql"]);
+  it("only the eight known migrations exist and all are applied by the harness", async () => {
+    const names = ["0001_init.sql", "0002_team_auth.sql", "0003_drop_rate_limits.sql", "0004_lifecycle.sql", "0005_upload_accounting.sql",
+      "0006_import_mapping.sql", "0007_team_meals.sql", "0008_coach_data_removal.sql"];
+    expect(env.TEST_MIGRATIONS.map((m) => m.name)).toEqual(names);
     const { results } = await env.DB.prepare("SELECT name FROM d1_migrations ORDER BY id").all<{ name: string }>();
-    expect(results.map((r) => r.name)).toEqual(["0001_init.sql", "0002_team_auth.sql", "0003_drop_rate_limits.sql", "0004_lifecycle.sql", "0005_upload_accounting.sql", "0006_import_mapping.sql"]);
+    expect(results.map((r) => r.name)).toEqual(names);
   });
 });
 
@@ -196,7 +202,13 @@ describe("0002 on a database seeded with 0001 data", () => {
     }
     expect(await count("program_state")).toBe(4);
 
-    await applyLaterMigrations(); // the Worker needs the full schema
+    await applyLaterMigrations("0007");
+    expect(await count("program_state", "user_id = 'coach'")).toBe(1);
+    await applyMigration(migration("0008")); // the Worker needs the full schema
+    // 0008 (0003 §5) removes the coach's backfilled personal row; athletes keep theirs.
+    expect(await count("program_state", "user_id = 'coach'")).toBe(0);
+    expect(await count("program_state")).toBe(3);
+    expect(await fkCheck()).toEqual([]);
     // End to end: the existing session cookie still works and the tracker shows the same state as before.
     const cookie = `dga_session=${sessionToken}`;
     const me = await apiJson<{ id: string; isOwner: boolean }>("/api/auth/me", { cookie });

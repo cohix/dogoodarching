@@ -39,6 +39,14 @@ async function sessionIdOf(session: Session): Promise<string> {
   return row.id;
 }
 
+/** A pre-0008 coach-owned plan file: the attachment row plus its R2 object. */
+async function seedLegacyCoachFile(coachId: string): Promise<void> {
+  const key = `plans/${coachId}/legacy-coach-notes`;
+  await env.ATTACHMENTS.put(key, new Uint8Array([1, 2, 3]));
+  await env.DB.prepare("INSERT INTO planned_session_attachments (user_id, day_key, kind, label, blob_key, mime_type, created_at) VALUES (?, 'mon', 'document', 'Coach notes', ?, 'application/pdf', ?)")
+    .bind(coachId, key, Date.now()).run();
+}
+
 async function blobKeysFor(userId: string): Promise<string[]> {
   const { results } = await env.DB.prepare("SELECT blob_key FROM planned_session_attachments WHERE user_id = ? AND blob_key != ''").bind(userId).all<{ blob_key: string }>();
   return results.map((row) => row.blob_key);
@@ -195,20 +203,22 @@ describe("DELETE /api/auth/account", () => {
   it("deleting a non-owner coach removes their rows and files, keeps athletes, their files and invites, and nulls references", async () => {
     const team = await setupTeam();
     const coachId = team.coach.user.id;
-    // The coach's own plan file, and a file they uploaded onto athleteA's plan.
-    await uploadOwnFile(team.coach, { label: "Coach notes" });
+    // A legacy own plan file (coaches can no longer create personal rows through
+    // the API since 0003 §5, so seed it as a pre-0008 row), and a file the coach
+    // uploaded onto athleteA's plan.
+    await seedLegacyCoachFile(coachId);
     const athleteFileId = await uploadFileForAthlete(team.coach, team.athleteA.user.id, { label: "For athlete" });
     const [coachKey] = await blobKeysFor(coachId);
     const [athleteKey] = await blobKeysFor(team.athleteA.user.id);
     expect(coachKey).toBeTruthy();
     expect(athleteKey).toBeTruthy();
     expect(await env.ATTACHMENTS.head(coachKey!)).not.toBeNull();
-    // A pending athlete invite from this coach, and a training session of their own.
+    // A pending athlete invite from this coach, a legacy training session of their own,
+    // and a team meal they posted (0003 §3).
     const pendingAthleteInvite = await createInvite(team.coach);
-    expect((await api("/api/sessions", {
-      json: { sessionDate: "2026-09-21", sessionType: "Range", customActivity: "", arrows: 30, durationMinutes: 30, focus: "", score: "", notes: "" },
-      cookie: team.coach.cookie,
-    })).status).toBe(200);
+    await env.DB.prepare("INSERT INTO training_sessions (user_id, session_date, session_type, arrows, created_at) VALUES (?, '2026-09-21', 'Range', 30, ?)")
+      .bind(coachId, Date.now()).run();
+    expect((await api("/api/coach/meals", { json: { name: "Coach oats", summary: "s", ingredients: "i", instructions: "m" }, cookie: team.coach.cookie })).status).toBe(200);
     expect((await userRow(team.athleteB.user.id))?.invited_by).toBe(coachId);
 
     const deleted = await api("/api/auth/account", { method: "DELETE", json: { password: DEFAULT_PASSWORD }, cookie: team.coach.cookie });
@@ -232,6 +242,10 @@ describe("DELETE /api/auth/account", () => {
     expect((await api(`/api/plan/attachments/${athleteFileId}/file`, { cookie: team.athleteA.cookie })).status).toBe(200);
     expect((await me(team.athleteA)).status).toBe(200);
     expect((await roster(team.owner)).athletes.map((a) => a.username)).toEqual(["athleteA", "athleteB"]);
+    // The team meal stays, with a NULL author shown as "Coach".
+    expect(await env.DB.prepare("SELECT author_id FROM team_meals").first("author_id")).toBeNull();
+    const meals = await apiJson<{ meals: Array<{ name: string; author: string }> }>("/api/coach/meals", { cookie: team.owner.cookie });
+    expect(meals.body.meals.map((meal) => [meal.name, meal.author])).toEqual([["Coach oats", "Coach"]]);
 
     // The unexpired athlete invite is still usable (creator NULL is fine for athletes).
     const invite = await env.DB.prepare("SELECT created_by FROM invites WHERE used_at IS NULL").first<{ created_by: string | null }>();

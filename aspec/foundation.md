@@ -49,9 +49,11 @@ The following table is the detailed access reference. The [README roles table](.
 
 | Capability | Athlete | Coach | Owner |
 |---|---|---|---|
-| Own tracker data and own export/import | Full access | Full access | Full access |
+| Own tracker data and own export/import | Full access | None (no personal tracker) | None (no personal tracker) |
 | Athlete plans, schedule and plan attachments | Own only | View/edit every athlete | View/edit every athlete |
 | Athlete weekly/cycle summaries | Own only | View every athlete | View every athlete |
+| Team overview of active athletes' current cycles | No | Yes | Yes |
+| Team meals in Fuel | Read all | Create/edit/delete any | Create/edit/delete any |
 | Another user's individual sessions, scores, notes, setups, maintenance or inspiration | No | No | No |
 | List athletes | No | Active by default; include deactivated | Active by default; include deactivated |
 | Invite athletes | No | Yes | Yes |
@@ -63,7 +65,7 @@ The following table is the detailed access reference. The [README roles table](.
 | Transfer ownership to another active coach | No | No | Yes |
 | Delete own account with password | Yes | Unless last active coach | Transfer ownership first |
 
-Download authorization currently checks attachment ownership **or any coach role**, including files belonging to coach accounts. Inviter provenance grants no permissions. All cross-user exports are forbidden.
+Download authorization currently checks attachment ownership **or any coach role**. Coaches no longer own plan files, so this covers athlete files. Inviter provenance grants no permissions. All cross-user exports are forbidden.
 
 Any coach may deactivate an athlete: login stops, sessions are revoked, and the default roster hides them. Data and the reserved username remain; coaches retain plan/summary access. Reactivation restores login eligibility but not old sessions. Coaches cannot be deactivated through these endpoints.
 
@@ -91,13 +93,13 @@ Purpose: coach any athlete in the deployment-wide team.
 
 Use-cases:
 
-- Invite athletes, edit their plans and attachments, adjust schedules and review weekly/cycle aggregates.
-- Maintain personal training data through the same personal endpoints as athletes.
+- Invite athletes, edit their plans and attachments, adjust schedules and review weekly/cycle aggregates, including the team overview on Today.
+- Post, edit and delete team meals that appear in every athlete's Fuel.
 
 RBAC:
 
-- Allowed: every athlete's plans and summaries, athlete invitations, own invitation management, own tracker data and athlete deactivation/reactivation.
-- Disallowed: coach invitations, coach roster, other coaches' invite management and athletes' individual logs.
+- Allowed: every athlete's plans and summaries, the team overview, team meals, athlete invitations, own invitation management and athlete deactivation/reactivation.
+- Disallowed: personal tracker routes and export/import (403; coaches have no personal training data), coach invitations, coach roster, other coaches' invite management, athletes' individual logs and athletes' own inspiration entries.
 
 ### Persona 3:
 
@@ -110,5 +112,5 @@ Use-cases:
 
 RBAC:
 
-- Allowed: own data; own plans and summaries are visible to all coaches.
-- Disallowed: other users' data, team/coach endpoints and invitation management.
+- Allowed: own data, including export/import, and reading team meals; own plans and summaries are visible to all coaches.
+- Disallowed: other users' data, team/coach endpoints (including meal writes) and invitation management.

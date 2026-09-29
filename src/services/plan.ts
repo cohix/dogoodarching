@@ -17,10 +17,15 @@ export type ProgramState = {
   updatedAt: Date;
 };
 
+/** A stored row, or the default anchored to the client's calendar day when there is none. */
+export function programStateOrDefault(row: ProgramState | undefined, today: string): ProgramState {
+  return row ?? { ...DEFAULT_PROGRAM_STATE, updatedAt: new Date(`${today}T12:00:00Z`) };
+}
+
 /** Stored program state, or the default anchored to the client's calendar day. */
 export async function loadProgramState(db: Db, userId: string, today: string): Promise<ProgramState> {
   const rows = await db.select().from(schema.programState).where(eq(schema.programState.userId, userId)).limit(1);
-  return rows[0] ?? { ...DEFAULT_PROGRAM_STATE, updatedAt: new Date(`${today}T12:00:00Z`) };
+  return programStateOrDefault(rows[0], today);
 }
 
 export const plannedSessionDefaults = [

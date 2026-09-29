@@ -234,18 +234,31 @@ const setupFields = {
 export const setupInput = z.object({ id: z.number().int().positive().optional(), ...setupFields });
 export const duplicateSetupInput = z.object({ poundage: z.number().int().min(1).max(100) });
 
+/** Recipe fields: the one set of rules for check-in recipes and team meals. */
+export const recipeInput = z.object({
+  name: z.string().min(1).max(200),
+  summary: z.string().min(1).max(1500),
+  ingredients: z.string().min(1).max(3000),
+  instructions: z.string().min(1).max(6000),
+});
+
 export const inspirationInput = z.object({
   thoughtText: z.string().min(1).max(3000),
   videoTitle: z.string().min(1).max(300),
   videoUrl: httpUrl,
-  recipeName: z.string().min(1).max(200),
-  recipeSummary: z.string().min(1).max(1500),
-  recipeIngredients: z.string().min(1).max(3000),
-  recipeInstructions: z.string().min(1).max(6000),
+  recipeName: recipeInput.shape.name,
+  recipeSummary: recipeInput.shape.summary,
+  recipeIngredients: recipeInput.shape.ingredients,
+  recipeInstructions: recipeInput.shape.instructions,
 });
+
+/** `POST /api/coach/meals` and the full replace in `PUT /api/coach/meals/:id`. */
+export const teamMealInput = recipeInput;
 
 export type SetupInput = z.infer<typeof setupInput>;
 export type InspirationInput = z.infer<typeof inspirationInput>;
+export type RecipeInput = z.infer<typeof recipeInput>;
+export type TeamMealInput = z.infer<typeof teamMealInput>;
 
 // ---------------------------------------------------------------------------
 // Transfer (import)

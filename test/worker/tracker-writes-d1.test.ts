@@ -2,7 +2,7 @@ import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { getDb } from "../../src/db";
 import { addPracticeScoreFor } from "../../src/services/scores";
-import { api, apiJson, bootstrapTeam } from "./helpers";
+import { acceptInvite, api, apiJson, bootstrapTeam, createInvite } from "./helpers";
 
 describe("tracker D1 write regressions", () => {
   it("keeps each score with its ten ends and rolls back a failed end insert", async () => {
@@ -31,6 +31,8 @@ describe("tracker D1 write regressions", () => {
 
   it("returns 404 for all six mutations against another user's rows or deleted rows", async () => {
     const { coach, athlete } = await bootstrapTeam();
+    // Personal routes are athlete-only (0003 §5), so the cross-user caller is another athlete.
+    const rival = await acceptInvite(await createInvite(coach), "rival");
     const session = { sessionDate: "2026-09-28", sessionType: "Range", customActivity: "", arrows: 30, durationMinutes: 20, focus: "", score: "", notes: "" };
     const setup = {
       poundage: 20, name: "Setup", limbRiser: "", tillerBolts: "", braceHeight: "", stringTwists: "", nockingPoint: "",
@@ -49,7 +51,7 @@ describe("tracker D1 write regressions", () => {
       { path: "/api/setups", method: "POST", json: { ...setup, id: setupRow.body.id } },
     ];
     for (const { path, ...options } of mutations) {
-      const response = await api(path, { ...options, cookie: coach.cookie });
+      const response = await api(path, { ...options, cookie: rival.cookie });
       expect(response.status, path).toBe(404);
       expect(await response.json()).toHaveProperty("error");
     }

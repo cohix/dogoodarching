@@ -8,6 +8,8 @@ import { PlanEditor } from "../plan/PlanEditor";
 import { cyclePlanFor, plannedSessionsFor } from "../plan/defaults";
 import { CycleSummaryCard } from "../dashboard/CycleHistoryModal";
 import { ArrowHistoryModal } from "../log/ArrowHistoryModal";
+import { ArrowsByWeekChart } from "../log/ArrowsByWeekChart";
+import { coachTeamOverviewKey } from "../coach/CoachToday";
 
 // One deployment is one team: every coach sees every athlete. The owner (the
 // first coach) additionally invites coaches, sees the coach list, and sees and
@@ -18,7 +20,12 @@ const inviteStatus = (invite: Invite, now: number): "pending" | "used" | "expire
 
 const formatInstant = (epochMs: number) => new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }).format(new Date(epochMs));
 
-export function TeamTab({ me }: { me: Me }) {
+/**
+ * `selectedAthleteId`/`onSelectAthlete` let the shell open an athlete's detail
+ * (e.g. from a coach Today card) as in-app state. Without them TeamTab keeps
+ * the selection itself.
+ */
+export function TeamTab({ me, selectedAthleteId, onSelectAthlete }: { me: Me; selectedAthleteId?: string | null; onSelectAthlete?: (athleteId: string | null) => void }) {
   const qc = useQueryClient();
   const [showDeactivated, setShowDeactivated] = useState(false);
   const [athleteMessage, setAthleteMessage] = useState("");
@@ -27,7 +34,9 @@ export function TeamTab({ me }: { me: Me }) {
   // A /me refresh can reveal a transfer performed from another session. Do
   // not reuse the old owner's broader invite list after that role change.
   const invitesQuery = useQuery({ queryKey: ["invites", me.id, me.isOwner], queryFn: () => api.listInvites() });
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [ownSelectedId, setOwnSelectedId] = useState<string | null>(null);
+  const selectedId = onSelectAthlete ? (selectedAthleteId ?? null) : ownSelectedId;
+  const setSelectedId = onSelectAthlete ?? setOwnSelectedId;
   const [inviteLink, setInviteLink] = useState<{ role: Role; url: string } | null>(null);
   const [inviteMessage, setInviteMessage] = useState("");
   const changeAthleteStatus = useMutation({
@@ -38,6 +47,7 @@ export function TeamTab({ me }: { me: Me }) {
       await Promise.all([
         qc.invalidateQueries({ queryKey: ["coach-athletes"] }),
         qc.invalidateQueries({ queryKey: ["coach-overview", athlete.id] }),
+        qc.invalidateQueries({ queryKey: [coachTeamOverviewKey] }),
       ]);
     },
     onError: (error) => setAthleteMessage(error instanceof ApiError ? error.message : "Couldn’t update this athlete. Try again."),
@@ -71,6 +81,8 @@ export function TeamTab({ me }: { me: Me }) {
   const now = Date.now();
   const invites = [...(invitesQuery.data ?? [])].sort((a, b) => b.createdAt - a.createdAt);
   const pendingInvites = invites.filter((invite) => inviteStatus(invite, now) === "pending");
+  // Opened from coach Today: wait for the roster rather than flashing the list.
+  if (selectedId && athletesQuery.isPending) return <Empty>Loading athlete…</Empty>;
   return <div className="space-y-5">
     {selected ? <AthleteDetail athlete={selected} onBack={() => setSelectedId(null)} /> : <>
       <section className="card p-4" aria-labelledby="invites-heading">
@@ -135,12 +147,16 @@ function AthleteDetail({ athlete, onBack }: { athlete: AthleteSummary; onBack: (
     queryKey: ["coach-overview", athlete.id, today],
     queryFn: () => api.athleteOverview(athlete.id, today),
   });
-  const refresh = () => qc.invalidateQueries({ queryKey: ["coach-overview", athlete.id] });
+  const refresh = () => Promise.all([
+    qc.invalidateQueries({ queryKey: ["coach-overview", athlete.id] }),
+    qc.invalidateQueries({ queryKey: [coachTeamOverviewKey] }),
+  ]);
   if (overview.isPending) return <div className="py-8 text-center text-sm text-[var(--dim)]">Loading {athlete.username}’s overview…</div>;
   if (!overview.data || overview.error) return <div className="card p-4"><button type="button" onClick={onBack} className="text-sm font-bold text-[var(--accent)]">← Back to team</button><p className="mt-3 text-sm text-[var(--text)]">This athlete’s overview couldn’t be loaded.</p><button type="button" onClick={() => overview.refetch()} className="mt-3 rounded-lg bg-[var(--accent)] px-3 py-2 text-xs font-bold text-white">Try again</button></div>;
   const o = overview.data;
   const totalArrows = o.weeklyArrows.reduce((sum, week) => sum + week.arrows, 0);
-  const orderedSummaries = [...o.cycleSummaries].sort((a, b) => b.cycle - a.cycle);
+  const currentSummary = o.cycleSummaries.find((summary) => summary.cycle === o.state.currentCycle) ?? null;
+  const earlierSummaries = o.cycleSummaries.filter((summary) => summary.cycle !== o.state.currentCycle).sort((a, b) => b.cycle - a.cycle);
   return <div className="space-y-6">
     <button type="button" onClick={onBack} className="text-sm font-bold text-[var(--accent)]">← Back to team</button>
     <div className="card p-4">
@@ -150,15 +166,22 @@ function AthleteDetail({ athlete, onBack }: { athlete: AthleteSummary; onBack: (
       <p className="mt-1 text-xs text-[var(--dim)]">Cycle {o.state.currentCycle}, Week {o.state.currentWeek} · {o.state.currentPoundage === null ? "Poundage not set" : `${o.state.currentPoundage} lb`}</p>
       <p className="mt-2 text-xs leading-5 text-[var(--dim)]">Every coach can view and edit {athlete.username}’s training plans and summaries. Individual log entries, scores, notes, gear, and check-ins stay private to the athlete.</p>
     </div>
+    <section aria-labelledby="current-cycle-heading">
+      <h2 id="current-cycle-heading" className="section-title mb-2">Current cycle</h2>
+      {currentSummary ? <CycleSummaryCard summary={currentSummary} currentWeek={o.state.currentWeek} /> : <Empty>No cycle data yet.</Empty>}
+    </section>
+    <section aria-labelledby="arrows-by-week-heading">
+      <h2 id="arrows-by-week-heading" className="section-title mb-2">Arrows by week</h2>
+      <div className="card p-4">
+        <button type="button" onClick={() => setArrowHistoryOpen(true)} className="flex w-full items-center justify-between gap-4 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]" aria-label={`Open ${athlete.username}’s arrows by week chart. ${totalArrows} arrows across ${o.weeklyArrows.length} logged weeks`}><p className="text-sm text-[var(--dim)]">{totalArrows} arrows across {o.weeklyArrows.length} logged {o.weeklyArrows.length === 1 ? "week" : "weeks"}</p><span className="shrink-0 text-sm font-bold text-[var(--accent)]">Full screen →</span></button>
+        <ArrowsByWeekChart weeklyArrows={o.weeklyArrows} emptyText={`No logged weeks yet. The chart starts with ${athlete.username}’s first range log.`} className="mt-4" />
+      </div>
+    </section>
     <PlanEditor plans={cyclePlanFor(o)} plannedSessions={plannedSessionsFor(o)} state={o.state} onSaved={refresh} athleteId={athlete.id} />
-    <section>
-      <h2 className="section-title mb-2">Arrows by week</h2>
-      <button type="button" onClick={() => setArrowHistoryOpen(true)} className="card flex w-full items-center justify-between gap-4 p-4 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]" aria-label={`Open ${athlete.username}’s arrows by week chart. ${totalArrows} arrows across ${o.weeklyArrows.length} logged weeks`}><div><p className="mt-1 text-sm text-[var(--dim)]">{totalArrows} arrows across {o.weeklyArrows.length} logged {o.weeklyArrows.length === 1 ? "week" : "weeks"}</p></div><span className="shrink-0 text-sm font-bold text-[var(--accent)]">View chart →</span></button>
-    </section>
-    <section>
-      <h2 className="section-title mb-2">Cycle summaries</h2>
-      {orderedSummaries.length === 0 ? <Empty>No cycle data yet.</Empty> : <div className="space-y-3">{orderedSummaries.map((summary) => <CycleSummaryCard key={summary.cycle} summary={summary} />)}</div>}
-    </section>
-    {arrowHistoryOpen && <ArrowHistoryModal weeklyArrows={o.weeklyArrows} onClose={() => setArrowHistoryOpen(false)} />}
+    {earlierSummaries.length > 0 && <section aria-labelledby="earlier-cycles-heading">
+      <h2 id="earlier-cycles-heading" className="section-title mb-2">Earlier cycles</h2>
+      <div className="space-y-3">{earlierSummaries.map((summary) => <CycleSummaryCard key={summary.cycle} summary={summary} />)}</div>
+    </section>}
+    {arrowHistoryOpen && <ArrowHistoryModal weeklyArrows={o.weeklyArrows} emptyText={`The chart starts with ${athlete.username}’s first range log.`} onClose={() => setArrowHistoryOpen(false)} />}
   </div>;
 }
