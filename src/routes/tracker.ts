@@ -2,15 +2,16 @@
 
 import { Hono } from "hono";
 import { getDb } from "../db";
+import { actingUserId, rateLimit } from "../lib/rate-limit";
 import { dateKeyUtc } from "../lib/dates";
 import { jsonError, parsePositiveInt, validateJson, validateQuery } from "../lib/http";
 import { authMiddleware, type AppBindings } from "../lib/rbac";
 import {
   adjustInput, checkInput, cycleWeekPlanInput, duplicateSetupInput, inspirationInput, maintenanceItemCheckInput,
-  maintenanceItemInput, maintenanceItemLabelInput, maintenanceSectionInput, plannedSessionFileInput, plannedSessionInput,
+  maintenanceItemInput, maintenanceItemLabelInput, maintenanceSectionInput, plannedSessionInput,
   plannedSessionLinkInput, poundageInput, practiceScoreInput, sessionInput, setupInput, trackerQuery, weeklyNoteInput,
 } from "../lib/validation";
-import { addPlannedSessionFileFor, addPlannedSessionLinkFor, deletePlannedSessionAttachmentFor, fileDownloadHeaders, openAttachmentFileFor } from "../services/attachments";
+import { uploadPlannedSessionFileFor, addPlannedSessionLinkFor, deletePlannedSessionAttachmentFor, fileDownloadHeaders, openAttachmentFileFor } from "../services/attachments";
 import { getTrackerPayload } from "../services/dashboard";
 import { addInspirationFor } from "../services/inspiration";
 import {
@@ -74,12 +75,8 @@ tracker.post("/plan/sessions/links", validateJson(plannedSessionLinkInput), asyn
   return c.json(await addPlannedSessionLinkFor(getDb(c.env.DB), c.get("user").id, c.req.valid("json")));
 });
 
-tracker.post("/plan/sessions/files", validateJson(plannedSessionFileInput), async (c) => {
-  try {
-    return c.json(await addPlannedSessionFileFor(getDb(c.env.DB), c.env.ATTACHMENTS, c.get("user").id, c.req.valid("json")));
-  } catch (error) {
-    return jsonError(c, 400, error instanceof Error ? error.message : "Upload failed");
-  }
+tracker.post("/plan/sessions/files", rateLimit("upload", actingUserId), async (c) => {
+  return c.json(await uploadPlannedSessionFileFor(getDb(c.env.DB), c.env.ATTACHMENTS, c.get("user").id, c.get("user").id, c.req.raw));
 });
 
 tracker.delete("/plan/attachments/:id", async (c) => {

@@ -19,11 +19,11 @@ Test:
 
 Releases:
 
-- Work from trunk `main`. The preview workflow checks each push to `main` (including merged PRs) before deploying. Deploys are serialized within each environment and are not cancelled mid-flight.
+- Work from trunk `main`. `CI` checks every push and pull request. Cloudflare, not GitHub Actions, builds and deploys.
 
 Versioning:
 
-- A release is identified by its resolved git commit SHA, used as the Worker version tag and in its version message. `package.json` version is not a release identifier and is not bumped for this workflow.
+- A release is identified by its git commit SHA. `package.json` version is not a release identifier and is not bumped for this workflow.
 
 Publishing:
 
@@ -31,7 +31,5 @@ Publishing:
 
 Deployment:
 
-- `.github/workflows/deploy-preview.yml` runs the same checks on a push to `main`; its `preview` environment job installs/builds, applies remote preview migrations, then deploys with `wrangler deploy --env preview --tag <SHA>`.
-- `.github/workflows/deploy-production.yml` is `workflow_dispatch`. Input `sha` selects a commit; empty means the current tip of `main`. The resolve job pins its full SHA, and both checks and deploy jobs check out that same commit. After checks, the `production` environment job installs/builds, migrates production, then deploys tagged with that SHA.
-- **Required setup:** configure the `production` GitHub environment's required reviewers. The YAML names the environment but cannot enforce its reviewer settings by itself. Workflow credentials and scopes are listed in [operations](operations.md#installing-and-running).
-- Both workflows migrate before deploying. Direct npm deploy scripts only build/deploy; operators must run migrations separately. See [environment commands](operations.md#environments). Real account deployment/approval behavior still requires hosted verification.
+- Cloudflare (Workers Builds) handles all deploys, for production and preview. The repository has no deploy workflows.
+- CI does not apply D1 migrations. The Cloudflare deploy command or an operator must run `npm run db:migrate` / `npm run db:migrate:preview` before a deploy whose code needs the new schema. See [environment commands](operations.md#environments).

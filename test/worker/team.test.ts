@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { deleteUser, overview, setupTeam, uploadFileForAthlete } from "./auth-fixtures";
 import { acceptInvite, api, apiJson, bootstrapCoach, createInvite } from "./helpers";
 
-type Roster = { athletes: Array<{ id: string; username: string; createdAt: string }> };
+type Roster = { athletes: Array<{ id: string; username: string; createdAt: string; deactivatedAt: string | null }> };
 
 describe("team model", () => {
   it("GET /api/coach/athletes returns every athlete for every coach, regardless of who invited them", async () => {
@@ -16,7 +16,8 @@ describe("team model", () => {
     expect(forOwner.body.athletes.map((a) => a.username)).toEqual(["athleteA", "athleteB"]); // sorted by username
     expect(forCoach.body).toEqual(forOwner.body);
     for (const athlete of forOwner.body.athletes) {
-      expect(Object.keys(athlete).sort()).toEqual(["createdAt", "id", "username"]);
+      expect(Object.keys(athlete).sort()).toEqual(["createdAt", "deactivatedAt", "id", "username"]);
+      expect(athlete.deactivatedAt).toBeNull();
       expect(athlete).not.toHaveProperty("coachId");
     }
     // Coaches never appear in the athlete roster.

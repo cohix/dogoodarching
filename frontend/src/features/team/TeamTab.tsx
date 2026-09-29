@@ -1,5 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { api, type AthleteSummary, type Invite, type Me, type Role } from "../../api";
+import { api, ApiError, type AthleteSummary, type Invite, type Me, type Role } from "../../api";
 import { useState } from "react";
 import { Empty } from "../../components/Empty";
 import { formatDate, localDate } from "../../lib/dates";
@@ -20,12 +20,28 @@ const formatInstant = (epochMs: number) => new Intl.DateTimeFormat(undefined, { 
 
 export function TeamTab({ me }: { me: Me }) {
   const qc = useQueryClient();
-  const athletesQuery = useQuery({ queryKey: ["coach-athletes"], queryFn: () => api.listAthletes() });
+  const [showDeactivated, setShowDeactivated] = useState(false);
+  const [athleteMessage, setAthleteMessage] = useState("");
+  const athletesQuery = useQuery({ queryKey: ["coach-athletes", { includeDeactivated: showDeactivated }], queryFn: () => api.listAthletes({ includeDeactivated: showDeactivated }) });
   const coachesQuery = useQuery({ queryKey: ["coach-coaches"], queryFn: () => api.listCoaches(), enabled: me.isOwner });
-  const invitesQuery = useQuery({ queryKey: ["invites"], queryFn: () => api.listInvites() });
+  // A /me refresh can reveal a transfer performed from another session. Do
+  // not reuse the old owner's broader invite list after that role change.
+  const invitesQuery = useQuery({ queryKey: ["invites", me.id, me.isOwner], queryFn: () => api.listInvites() });
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [inviteLink, setInviteLink] = useState<{ role: Role; url: string } | null>(null);
   const [inviteMessage, setInviteMessage] = useState("");
+  const changeAthleteStatus = useMutation({
+    mutationFn: (athlete: AthleteSummary) => athlete.deactivatedAt ? api.reactivateAthlete(athlete.id) : api.deactivateAthlete(athlete.id),
+    onMutate: () => setAthleteMessage(""),
+    onSuccess: async (athlete) => {
+      setAthleteMessage(`${athlete.username} ${athlete.deactivatedAt ? "deactivated. Their data is kept and sign-in is disabled." : "reactivated. They can sign in again."}`);
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ["coach-athletes"] }),
+        qc.invalidateQueries({ queryKey: ["coach-overview", athlete.id] }),
+      ]);
+    },
+    onError: (error) => setAthleteMessage(error instanceof ApiError ? error.message : "Couldn’t update this athlete. Try again."),
+  });
   const refreshInvites = () => qc.invalidateQueries({ queryKey: ["invites"] });
   const createInvite = useMutation({
     mutationFn: (role: Role) => api.createInvite({ role }),
@@ -87,11 +103,25 @@ export function TeamTab({ me }: { me: Me }) {
           : <div className="card divide-y divide-[var(--border)]">{coachesQuery.data.coaches.map((coach) => <div key={coach.id} className="flex items-center justify-between gap-3 p-4"><div className="min-w-0"><p className="font-bold">{coach.username}{coach.id === me.id && <span className="ml-2 text-xs font-semibold text-[var(--dim)]">(you)</span>}</p><p className="mt-0.5 text-xs text-[var(--dim)]">Joined {formatDate(coach.createdAt.slice(0, 10))}</p></div>{coach.isOwner && <span className="shrink-0 rounded-full bg-[var(--accent-soft)] px-2.5 py-1 text-xs font-bold text-[var(--accent)]">Owner</span>}</div>)}</div>}
       </section>}
       <section>
-        <h2 className="section-title mb-2">Athletes</h2>
+        <div className="mb-2 flex items-center justify-between gap-3">
+          <h2 className="section-title">Athletes</h2>
+          <label className="flex items-center gap-2 text-xs font-bold"><input type="checkbox" checked={showDeactivated} onChange={(event) => setShowDeactivated(event.target.checked)} />Show deactivated</label>
+        </div>
+        {athleteMessage && <p role="status" className="mb-3 text-sm text-[var(--dim)]">{athleteMessage}</p>}
         {athletesQuery.isPending ? <Empty>Loading athletes…</Empty>
           : athletesQuery.error ? <div className="card p-4"><p className="text-sm text-[var(--text)]">Athletes couldn’t be loaded.</p><button type="button" onClick={() => athletesQuery.refetch()} className="mt-3 rounded-lg bg-[var(--accent)] px-3 py-2 text-xs font-bold text-white">Try again</button></div>
-          : athletesQuery.data.athletes.length === 0 ? <Empty>No athletes yet. Create an athlete invite above to add the first.</Empty>
-          : <div className="space-y-2">{athletesQuery.data.athletes.map((athlete) => <button type="button" key={athlete.id} onClick={() => setSelectedId(athlete.id)} className="card flex w-full items-center justify-between gap-3 p-4 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]" aria-label={`Open ${athlete.username}’s training overview`}><div className="min-w-0"><p className="font-bold">{athlete.username}</p><p className="mt-0.5 text-xs text-[var(--dim)]">Joined {formatDate(athlete.createdAt.slice(0, 10))}</p></div><span aria-hidden="true" className="shrink-0 text-sm font-bold text-[var(--accent)]">→</span></button>)}</div>}
+          : athletesQuery.data.athletes.length === 0 ? <Empty>{showDeactivated ? "No athletes yet. Create an athlete invite above to add the first." : "No active athletes. Invite an athlete or turn on Show deactivated."}</Empty>
+          : <div className="space-y-2">{athletesQuery.data.athletes.map((athlete) => <div key={athlete.id} className="card flex items-center gap-3 p-4">
+            <button type="button" onClick={() => setSelectedId(athlete.id)} className="min-w-0 flex-1 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]" aria-label={`Open ${athlete.username}’s training overview`}>
+              <p className="font-bold">{athlete.username}</p>
+              {athlete.deactivatedAt && <p className="mt-1 text-xs font-bold text-[var(--accent)]">Deactivated</p>}
+              <p className="mt-0.5 text-xs text-[var(--dim)]">Joined {formatDate(athlete.createdAt.slice(0, 10))}</p>
+              <span className="mt-1 block text-xs font-bold text-[var(--accent)]">View overview →</span>
+            </button>
+            <button type="button" disabled={changeAthleteStatus.isPending} className="shrink-0 rounded-lg border border-[var(--border)] px-3 py-2 text-xs font-bold text-[var(--accent)] disabled:opacity-50" aria-label={`${athlete.deactivatedAt ? "Reactivate" : "Deactivate"} ${athlete.username}`} onClick={() => {
+              if (athlete.deactivatedAt || window.confirm(`Deactivate ${athlete.username}? They will be signed out and unable to sign in. Their training data will be kept.`)) changeAthleteStatus.mutate(athlete);
+            }}>{changeAthleteStatus.isPending && changeAthleteStatus.variables.id === athlete.id ? "Updating…" : athlete.deactivatedAt ? "Reactivate" : "Deactivate"}</button>
+          </div>)}</div>}
       </section>
     </>}
   </div>;
@@ -116,6 +146,7 @@ function AthleteDetail({ athlete, onBack }: { athlete: AthleteSummary; onBack: (
     <div className="card p-4">
       <p className="text-xs font-bold uppercase tracking-[.16em] text-[var(--accent)]">Athlete</p>
       <h2 className="mt-1 text-2xl font-extrabold tracking-[-.02em]">{athlete.username}</h2>
+      {athlete.deactivatedAt && <p className="mt-2 text-sm font-bold text-[var(--accent)]">Deactivated · history and plans are still available</p>}
       <p className="mt-1 text-xs text-[var(--dim)]">Cycle {o.state.currentCycle}, Week {o.state.currentWeek} · {o.state.currentPoundage === null ? "Poundage not set" : `${o.state.currentPoundage} lb`}</p>
       <p className="mt-2 text-xs leading-5 text-[var(--dim)]">Every coach can view and edit {athlete.username}’s training plans and summaries. Individual log entries, scores, notes, gear, and check-ins stay private to the athlete.</p>
     </div>

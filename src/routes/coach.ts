@@ -4,16 +4,17 @@
 
 import { Hono } from "hono";
 import { getDb } from "../db";
+import { actingUserId, rateLimit } from "../lib/rate-limit";
 import { dateKeyUtc } from "../lib/dates";
 import { jsonError, parsePositiveInt, validateJson, validateQuery } from "../lib/http";
 import { authMiddleware, requireCoach, resolveAthlete, type AppBindings } from "../lib/rbac";
 import {
-  adjustInput, cycleWeekPlanInput, plannedSessionFileInput, plannedSessionInput, plannedSessionLinkInput, todayQuery,
+  adjustInput, athleteListQuery, cycleWeekPlanInput, plannedSessionInput, plannedSessionLinkInput, todayQuery,
 } from "../lib/validation";
-import { addPlannedSessionFileFor, addPlannedSessionLinkFor, deletePlannedSessionAttachmentFor } from "../services/attachments";
+import { uploadPlannedSessionFileFor, addPlannedSessionLinkFor, deletePlannedSessionAttachmentFor } from "../services/attachments";
 import { getCoachOverview } from "../services/dashboard";
 import { adjustScheduleFor, saveCycleWeekPlanFor, savePlannedSessionFor } from "../services/plan";
-import { listAthletes, listCoaches } from "../services/team";
+import { deactivateAthlete, listAthletes, listCoaches, reactivateAthlete } from "../services/team";
 
 const coach = new Hono<AppBindings>();
 
@@ -24,8 +25,30 @@ coach.get("/coaches", async (c) => {
   return c.json({ coaches: await listCoaches(getDb(c.env.DB)) });
 });
 
-coach.get("/athletes", async (c) => {
-  return c.json({ athletes: await listAthletes(getDb(c.env.DB)) });
+// Active athletes by default; `?include=deactivated` adds deactivated ones
+// (flagged by `deactivatedAt`) so they can be reactivated.
+coach.get("/athletes", validateQuery(athleteListQuery), async (c) => {
+  const includeDeactivated = c.req.valid("query").include === "deactivated";
+  return c.json({ athletes: await listAthletes(getDb(c.env.DB), { includeDeactivated }) });
+});
+
+// Deactivation/reactivation are idempotent; `resolveAthlete` matches athletes
+// only (active or not), so a coach id is a 404. Plan routes below keep
+// working for deactivated athletes so their history stays viewable.
+coach.post("/athletes/:athleteId/deactivate", async (c) => {
+  const athlete = await resolveAthlete(c, c.req.param("athleteId"));
+  if (!athlete) return jsonError(c, 404, "Athlete not found");
+  const status = await deactivateAthlete(getDb(c.env.DB), athlete.id);
+  if (!status) return jsonError(c, 404, "Athlete not found");
+  return c.json(status);
+});
+
+coach.post("/athletes/:athleteId/reactivate", async (c) => {
+  const athlete = await resolveAthlete(c, c.req.param("athleteId"));
+  if (!athlete) return jsonError(c, 404, "Athlete not found");
+  const status = await reactivateAthlete(getDb(c.env.DB), athlete.id);
+  if (!status) return jsonError(c, 404, "Athlete not found");
+  return c.json(status);
 });
 
 coach.get("/athletes/:athleteId/overview", validateQuery(todayQuery), async (c) => {
@@ -59,14 +82,10 @@ coach.post("/athletes/:athleteId/plan/sessions/links", validateJson(plannedSessi
   return c.json(await addPlannedSessionLinkFor(getDb(c.env.DB), athlete.id, c.req.valid("json")));
 });
 
-coach.post("/athletes/:athleteId/plan/sessions/files", validateJson(plannedSessionFileInput), async (c) => {
+coach.post("/athletes/:athleteId/plan/sessions/files", rateLimit("upload", actingUserId), async (c) => {
   const athlete = await resolveAthlete(c, c.req.param("athleteId"));
   if (!athlete) return jsonError(c, 404, "Athlete not found");
-  try {
-    return c.json(await addPlannedSessionFileFor(getDb(c.env.DB), c.env.ATTACHMENTS, athlete.id, c.req.valid("json")));
-  } catch (error) {
-    return jsonError(c, 400, error instanceof Error ? error.message : "Upload failed");
-  }
+  return c.json(await uploadPlannedSessionFileFor(getDb(c.env.DB), c.env.ATTACHMENTS, athlete.id, c.get("user").id, c.req.raw));
 });
 
 coach.delete("/athletes/:athleteId/plan/attachments/:attachmentId", async (c) => {

@@ -15,6 +15,10 @@ export const users = sqliteTable("users", {
   isOwner: integer("is_owner", { mode: "boolean" }).notNull().default(false),
   invitedBy: text("invited_by").references((): AnySQLiteColumn => users.id, { onDelete: "set null" }),
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull().$defaultFn(() => new Date()),
+  // Athletes only (0002 §7): set by a coach to disable login and hide the
+  // athlete from the roster; NULL means active. Data and username are kept.
+  // Last in the column list so insert-select statements append it.
+  deactivatedAt: integer("deactivated_at", { mode: "timestamp_ms" }),
 }, (t) => [primaryKey({ columns: [t.id] }), uniqueIndex("users_username_ci_unique").on(sql`lower(${t.username})`), uniqueIndex("users_one_owner_unique").on(t.isOwner).where(sql`${t.isOwner} = 1`)]);
 
 export const sessions = sqliteTable("sessions", {
@@ -35,11 +39,22 @@ export const invites = sqliteTable("invites", {
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull().$defaultFn(() => new Date()),
 }, (t) => [primaryKey({ columns: [t.id] }), index("idx_invites_created_by").on(t.createdBy)]);
 
-export const rateLimits = sqliteTable("rate_limits", {
-  key: text("key"),
+// Durable R2 cleanup queue (0002 §7). A row is written in the SAME D1 batch
+// that removes the last reference to a blob (account deletion, import
+// replacement, attachment deletion, abandoned upload recovery); the blob is
+// deleted from R2 only after that batch commits. Deliberately NOT foreign-keyed
+// to users: records must survive the deletion of the user whose files they
+// name. `blob_key` is the primary key so re-enqueueing is idempotent.
+export const blobCleanup = sqliteTable("blob_cleanup", {
+  blobKey: text("blob_key").notNull(),
+  /** Free-text origin for operators, e.g. `account-delete`, `import`, `attachment-delete`. */
+  reason: text("reason").notNull().default(""),
   attempts: integer("attempts").notNull().default(0),
-  windowStart: integer("window_start").notNull(), // Epoch-ms numeric counter anchor used directly by the rate-limit arithmetic.
-}, (t) => [primaryKey({ columns: [t.key] })]);
+  lastError: text("last_error"),
+  /** Earliest instant the scheduled job may (re)try this key; failures push it out. */
+  nextAttemptAt: integer("next_attempt_at", { mode: "timestamp_ms" }).notNull(),
+  createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull().$defaultFn(() => new Date()),
+}, (t) => [primaryKey({ columns: [t.blobKey] }), index("idx_blob_cleanup_next_attempt").on(t.nextAttemptAt)]);
 
 // ---------------------------------------------------------------------------
 // Tracker tables (ported from the reference schema, each scoped by user_id)
@@ -85,6 +100,16 @@ export const plannedSessionOverrides = sqliteTable("planned_session_overrides", 
   updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull().$defaultFn(() => new Date()),
 }, (t) => [primaryKey({ columns: [t.userId, t.dayKey] }), index("idx_planned_session_overrides_user").on(t.userId)]);
 
+// No user FK: recovery records must survive either account's deletion.
+// Expired rows are recovery tombstones, excluded from quota accounting.
+export const uploadReservations = sqliteTable("upload_reservations", {
+  blobKey: text("blob_key").primaryKey(),
+  userId: text("user_id").notNull(),
+  actorId: text("actor_id").notNull(),
+  sizeBytes: integer("size_bytes").notNull(),
+  expiresAt: integer("expires_at", { mode: "timestamp_ms" }).notNull(),
+}, (t) => [index("idx_upload_reservations_user").on(t.userId), index("idx_upload_reservations_expiry").on(t.expiresAt)]);
+
 export const plannedSessionAttachments = sqliteTable("planned_session_attachments", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
@@ -94,6 +119,9 @@ export const plannedSessionAttachments = sqliteTable("planned_session_attachment
   url: text("url").notNull().default(""),
   blobKey: text("blob_key").notNull().default(""),
   mimeType: text("mime_type").notNull().default(""),
+  sizeBytes: integer("size_bytes"),
+  /** Backfill retry ordering; NULL means never attempted. */
+  sizeCheckedAt: integer("size_checked_at", { mode: "timestamp_ms" }),
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull().$defaultFn(() => new Date()),
 }, (t) => [index("idx_planned_session_attachments_user").on(t.userId)]);
 
@@ -119,7 +147,9 @@ export const maintenanceItems = sqliteTable("maintenance_items", {
   sortOrder: integer("sort_order").notNull().default(0),
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull().$defaultFn(() => new Date()),
   updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull().$defaultFn(() => new Date()),
-}, (t) => [index("idx_maintenance_items_user").on(t.userId)]);
+  // Ephemeral mapping, set and cleared inside the same atomic import batch.
+  importKey: text("import_key"),
+}, (t) => [index("idx_maintenance_items_user").on(t.userId), uniqueIndex("maintenance_import_key_unique").on(t.userId, t.importKey)]);
 
 export const inspirationEntries = sqliteTable("inspiration_entries", {
   id: integer("id").primaryKey({ autoIncrement: true }),
@@ -149,7 +179,8 @@ export const practiceScores = sqliteTable("practice_scores", {
   scoreDate: text("score_date").notNull(),
   total: integer("total").notNull(),
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull().$defaultFn(() => new Date()),
-}, (t) => [index("idx_practice_scores_user").on(t.userId)]);
+  importKey: text("import_key"),
+}, (t) => [index("idx_practice_scores_user").on(t.userId), uniqueIndex("score_import_key_unique").on(t.userId, t.importKey)]);
 
 export const practiceScoreEnds = sqliteTable("practice_score_ends", {
   id: integer("id").primaryKey({ autoIncrement: true }),

@@ -9,9 +9,10 @@
 // Rules:
 // - `/api/*` is NEVER cached: every API request goes straight to the network,
 //   because the Worker/D1 backend is always the source of truth.
-// - Navigations (including `/invite/<token>` deep links, served index.html by
-//   the Worker's SPA fallback) serve the cached shell offline and refresh it
-//   online.
+// - Navigations (`/invite#<token>` and legacy `/invite/<token>` links use the
+//   Worker's SPA fallback) serve the shell offline and refresh it online.
+//   Fragments never reach the network or cache keys. Returning the shell does
+//   not redirect or rewrite the browser URL; the SPA captures and scrubs tokens.
 // - Built assets under `/assets/` are runtime-cached cache-first.
 
 const CACHE_NAME = "dga-shell-__BUILD_HASH__";
@@ -58,8 +59,8 @@ self.addEventListener("fetch", (event) => {
   // The API is always the source of truth — never serve or store API responses.
   if (url.pathname.startsWith("/api/")) return;
 
-  // Navigations ("/", "/invite/<token>", …): network first so deep links load
-  // fresh; fall back to the cached shell when offline.
+  // Navigations ("/", "/invite", legacy paths, …): network first so deep links
+  // load fresh; cache only under /index.html, never under an invite token.
   if (request.mode === "navigate") {
     event.respondWith(
       fetch(request)

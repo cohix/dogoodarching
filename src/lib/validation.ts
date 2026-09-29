@@ -2,6 +2,7 @@
 // and the import path share these so they can never accept different shapes.
 
 import { z } from "zod";
+import { MAX_PROGRAM_CYCLES } from "./dates";
 
 // ---------------------------------------------------------------------------
 // Enums and primitives
@@ -15,11 +16,14 @@ export const maintenanceSection = z.enum(["Weekly", "Monthly", "Quarterly"]);
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 
 /** Calendar date in the athlete's local calendar, `YYYY-MM-DD`. */
-export const dateInput = z.string().regex(DATE_PATTERN);
+export const dateInput = z.string().regex(DATE_PATTERN).refine((value) => {
+  const date = new Date(`${value}T12:00:00Z`);
+  return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value;
+}, { message: "Invalid calendar date" });
 
 /** Optional `?today=YYYY-MM-DD` query accepted by dashboard-style reads. */
 export const todayQuery = z.object({
-  today: z.string().regex(DATE_PATTERN, { message: "Invalid today parameter" }).optional(),
+  today: z.string().refine(value => dateInput.safeParse(value).success, { message: "Invalid today parameter" }).optional(),
 });
 
 /** Exclusive descending (session_date, id) boundary, built from the last row. */
@@ -39,7 +43,7 @@ export const trackerQuery = todayQuery.extend({ before: sessionCursor.optional()
 export type SessionCursor = z.infer<typeof sessionCursor>;
 
 /** ISO date-time string, as written by export. */
-export const isoDateTime = z.string().refine((s) => !Number.isNaN(Date.parse(s)), { message: "Invalid date" });
+export const isoDateTime = z.iso.datetime();
 
 // Only http/https links may be stored; anything else (javascript:, data:, …)
 // is rejected server-side so a stored URL can never become an XSS vector.
@@ -67,16 +71,40 @@ export const acceptInviteInput = z.object({
   password: passwordSchema,
 });
 
+/**
+ * A password being verified (not set): only bounded, so an account whose
+ * password predates today's minimum length can still confirm it. New
+ * passwords always use `passwordSchema`.
+ */
+export const currentPasswordSchema = z.string().min(1, { message: "Password is required" }).max(128, {
+  message: "Password must be at most 128 characters",
+});
+
+// Account lifecycle (0002 §7)
+export const changePasswordInput = z.object({ currentPassword: currentPasswordSchema, newPassword: passwordSchema });
+export const deleteAccountInput = z.object({ password: currentPasswordSchema });
+export const transferOwnershipInput = z.object({
+  coachId: z.string().min(1).max(64, { message: "Invalid coach id" }),
+  password: currentPasswordSchema,
+});
+/** `GET /api/coach/athletes?include=deactivated` lists deactivated athletes too. */
+export const athleteListQuery = z.object({
+  include: z.enum(["deactivated"], { message: "Invalid include parameter" }).optional(),
+});
+
 export type CredentialsInput = z.infer<typeof credentialsInput>;
 export type CreateInviteInput = z.infer<typeof createInviteInput>;
 export type AcceptInviteInput = z.infer<typeof acceptInviteInput>;
+export type ChangePasswordInput = z.infer<typeof changePasswordInput>;
+export type DeleteAccountInput = z.infer<typeof deleteAccountInput>;
+export type TransferOwnershipInput = z.infer<typeof transferOwnershipInput>;
 
 // ---------------------------------------------------------------------------
 // Training log: sessions, scores, weekly notes
 // ---------------------------------------------------------------------------
 
 export const sessionInput = z.object({
-  sessionDate: z.string().regex(DATE_PATTERN),
+  sessionDate: dateInput,
   sessionType,
   customActivity: z.string().trim().max(80),
   arrows: z.number().int().min(0).max(1000),
@@ -86,14 +114,11 @@ export const sessionInput = z.object({
   notes: z.string().max(3000),
 }).refine((value) => value.sessionType !== "Other" || value.customActivity.length > 0, { message: "Name the activity", path: ["customActivity"] });
 
-const scoreEndInput = z.tuple([
-  z.number().int().min(0).max(10),
-  z.number().int().min(0).max(10),
-  z.number().int().min(0).max(10),
-]);
+const arrowValue = z.number().int().min(0).max(10);
+const scoreEndInput = z.tuple([arrowValue, arrowValue, arrowValue]);
 
 export const practiceScoreInput = z.object({
-  scoreDate: z.string().regex(DATE_PATTERN),
+  scoreDate: dateInput,
   ends: z.array(scoreEndInput).length(10),
 });
 
@@ -120,16 +145,28 @@ export const plannedSessionLinkInput = z.object({
   url: httpUrl,
 });
 
+/** The only upload MIME allowlist; also used to sanitize legacy downloads. */
+export const UPLOAD_MIME_TYPES = [
+  "image/jpeg", "image/png", "image/webp", "image/heic", "application/pdf",
+  "application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.ms-excel", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "application/vnd.ms-powerpoint", "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+] as const;
+
+export function normalizeMimeType(value: string): string {
+  return value.split(";")[0].trim().toLowerCase();
+}
+
+export function effectiveFileMimeType(value: string): string {
+  const normalized = normalizeMimeType(value);
+  return (UPLOAD_MIME_TYPES as readonly string[]).includes(normalized) ? normalized : "application/octet-stream";
+}
+
+/** Raw upload metadata comes from the query string, never from the file body. */
 export const plannedSessionFileInput = z.object({
   dayKey: planDayKey,
   kind: z.enum(["document", "photo"]),
   label: z.string().trim().min(1).max(160),
-  // MIME type must look like "type/subtype" so the stored value can't be
-  // smuggled into a download response as something unexpected.
-  mimeType: z.string().trim().min(1).max(120).regex(/^[\w.+-]+\/[\w.+-]+$/, {
-    message: "Invalid MIME type",
-  }),
-  dataBase64: z.string().min(1).max(12_000_000),
 });
 
 export const cycleWeekPlanInput = z.object({
@@ -190,7 +227,8 @@ const setupFields = {
   stringTwists: z.string().max(100), nockingPoint: z.string().max(100), centerShot: z.string().max(200),
   plunger: z.string().max(300), gripNotes: z.string().max(1000), stabilizer: z.string().max(500),
   clickerPosition: z.string().max(200), bareShaft: z.string().max(1000), walkBack: z.string().max(1000),
-  arrowsInUse: z.string().max(500), sightMarks: z.record(z.string(), z.string()),
+  arrowsInUse: z.string().max(500), sightMarks: z.record(z.string().max(100), z.string().max(500))
+    .refine((marks) => Object.keys(marks).length <= 100, { message: "At most 100 sight marks" }),
 };
 
 export const setupInput = z.object({ id: z.number().int().positive().optional(), ...setupFields });
@@ -213,60 +251,90 @@ export type InspirationInput = z.infer<typeof inspirationInput>;
 // Transfer (import)
 // ---------------------------------------------------------------------------
 
+const sourceId = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
+const created = { createdAt: isoDateTime };
+const updated = { updatedAt: isoDateTime };
+const importedCheck = z.object({ key: checkInput.shape.key, checked: checkInput.shape.checked, ...updated });
+const sightMarksJson = z.string().max(64_000).refine((value) => {
+  try { return setupFields.sightMarks.safeParse(JSON.parse(value)).success; } catch { return false; }
+}, { message: "Sight marks must be a JSON object of strings (at most 100 marks)" });
+
+// These row caps are structural ceilings; byte and atomic batch budgets can
+// reject a smaller document. Legacy `entries` is intentionally stripped.
 export const importPayloadSchema = z.object({
   version: z.literal(1),
   data: z.object({
-    trainingSessions: z.array(z.object({
-      id: z.number().int(), sessionDate: z.string(), sessionType, customActivity: z.string(),
-      arrows: z.number().int(), durationMinutes: z.number().int(), focus: z.string(), score: z.string(),
-      notes: z.string(), createdAt: isoDateTime,
-    })),
+    trainingSessions: z.array(sessionInput.safeExtend({ id: sourceId, ...created })).max(20_000),
     practiceScores: z.array(z.object({
-      id: z.number().int(), scoreDate: z.string(), total: z.number().int(), createdAt: isoDateTime,
-    })),
+      id: sourceId, scoreDate: dateInput, total: z.number().int().min(0).max(300), ...created,
+    })).max(5_000),
     practiceScoreEnds: z.array(z.object({
-      id: z.number().int(), scoreId: z.number().int(), endNumber: z.number().int(), arrow1: z.number().int(),
-      arrow2: z.number().int(), arrow3: z.number().int(), endTotal: z.number().int(),
-    })),
+      id: sourceId, scoreId: sourceId, endNumber: z.number().int().min(1).max(10),
+      arrow1: arrowValue, arrow2: arrowValue, arrow3: arrowValue,
+      endTotal: z.number().int().min(0).max(30),
+    })).max(50_000),
     programState: z.object({
-      currentPoundage: z.number().int().nullable(), currentCycle: z.number().int(), currentWeek: z.number().int(),
-      updatedAt: isoDateTime,
+      currentPoundage: poundageInput.shape.poundage.nullable(),
+      currentCycle: z.number().int().min(1).max(MAX_PROGRAM_CYCLES),
+      currentWeek: cycleWeekPlanInput.shape.weekNumber, ...updated,
     }).nullable(),
-    cycleWeekPlans: z.array(z.object({
-      weekNumber: z.number().int(), primaryFocus: z.string(), backgroundFocusOne: z.string(),
-      backgroundFocusTwo: z.string(), updatedAt: isoDateTime,
-    })),
-    plannedSessionOverrides: z.array(z.object({
-      dayKey: planDayKey, sessionType: z.string(), detail: z.string(), prescription: z.string(),
-      updatedAt: isoDateTime,
-    })),
-    plannedSessionAttachments: z.array(z.object({
-      id: z.number().int(), dayKey: planDayKey, kind: attachmentKind,
-      label: z.string(), url: z.string(), mimeType: z.string(), createdAt: isoDateTime,
-    })),
-    milestoneChecks: z.array(z.object({ key: z.string(), checked: z.boolean(), updatedAt: isoDateTime })),
-    maintenanceChecks: z.array(z.object({ key: z.string(), checked: z.boolean(), updatedAt: isoDateTime })),
-    maintenanceItems: z.array(z.object({
-      id: z.number().int(), section: maintenanceSection, label: z.string(),
-      sortOrder: z.number().int(), createdAt: isoDateTime, updatedAt: isoDateTime,
-    })),
-    inspirationEntries: z.array(z.object({
-      id: z.number().int(), thoughtText: z.string(), videoTitle: z.string(), videoUrl: z.string(),
-      recipeName: z.string(), recipeSummary: z.string(), recipeIngredients: z.string(),
-      recipeInstructions: z.string(), updatedAt: isoDateTime,
-    })),
+    cycleWeekPlans: z.array(cycleWeekPlanInput.extend(updated)).max(6),
+    plannedSessionOverrides: z.array(plannedSessionInput.extend(updated)).max(7),
+    plannedSessionAttachments: z.array(plannedSessionLinkInput.extend({
+      id: sourceId, kind: z.literal("link"), mimeType: z.string().max(100), ...created,
+    })).max(5_000),
+    milestoneChecks: z.array(importedCheck).max(5_000),
+    maintenanceChecks: z.array(importedCheck).max(5_000),
+    maintenanceItems: z.array(maintenanceItemInput.extend({
+      id: sourceId, sortOrder: z.number().int().min(0).max(1_000_000), ...created, ...updated,
+    })).max(5_000),
+    inspirationEntries: z.array(inspirationInput.extend({ id: sourceId, ...updated })).max(5_000),
     weeklyNotes: z.array(z.object({
-      id: z.number().int(), weekStart: z.string(), notes: z.string(),
-      createdAt: isoDateTime, updatedAt: isoDateTime,
-    })),
-    bowSetups: z.array(z.object({
-      id: z.number().int(), poundage: z.number().int(), name: z.string(), limbRiser: z.string(),
-      tillerBolts: z.string(), braceHeight: z.string(), stringTwists: z.string(), nockingPoint: z.string(),
-      centerShot: z.string(), plunger: z.string(), gripNotes: z.string(), stabilizer: z.string(),
-      clickerPosition: z.string(), bareShaft: z.string(), walkBack: z.string(), arrowsInUse: z.string(),
-      sightMarksJson: z.string(), updatedAt: isoDateTime,
-    })),
-    // Zod strips unknown keys, including entries from legacy version-1 exports.
+      id: sourceId, weekStart: dateInput, notes: weeklyNoteInput.shape.notes, ...created, ...updated,
+    })).max(5_000),
+    bowSetups: z.array(setupInput.omit({ sightMarks: true }).extend({
+      id: sourceId, sightMarksJson, ...updated,
+    })).max(1_000),
+  }).superRefine((data, ctx) => {
+    const fail = (path: (string | number)[], message: string) => ctx.addIssue({ code: "custom", path, message });
+    for (const [name, rows] of Object.entries(data)) {
+      if (!Array.isArray(rows)) continue;
+      const ids = new Set<number>();
+      const keys = new Set<string | number>();
+      const natural = ({ cycleWeekPlans: "weekNumber", plannedSessionOverrides: "dayKey", milestoneChecks: "key", maintenanceChecks: "key", weeklyNotes: "weekStart" } as Record<string, string>)[name];
+      rows.forEach((row, index) => {
+        if ("id" in row) {
+          if (ids.has(row.id)) fail([name, index, "id"], "Duplicate source id");
+          ids.add(row.id);
+        }
+        if (natural) {
+          let key = (row as unknown as Record<string, string | number>)[natural];
+          if (name === "maintenanceChecks" && typeof key === "string" && /^item:\d+$/.test(key)) key = `item:${Number(key.slice(5))}`;
+          if (keys.has(key)) fail([name, index, natural], "Duplicate key");
+          keys.add(key);
+        }
+      });
+    }
+    const scores = new Map(data.practiceScores.map((score) => [score.id, { numbers: new Set<number>(), total: 0 }]));
+    data.practiceScoreEnds.forEach((end, index) => {
+      const score = scores.get(end.scoreId);
+      if (!score) { fail(["practiceScoreEnds", index, "scoreId"], "Score is absent"); return; }
+      if (score.numbers.has(end.endNumber)) fail(["practiceScoreEnds", index, "endNumber"], "Duplicate score end");
+      score.numbers.add(end.endNumber);
+      const total = end.arrow1 + end.arrow2 + end.arrow3;
+      if (end.endTotal !== total) fail(["practiceScoreEnds", index, "endTotal"], "Total does not match arrows");
+      score.total += total;
+    });
+    data.practiceScores.forEach((score, index) => {
+      const ends = scores.get(score.id)!;
+      if (ends.numbers.size !== 10) fail(["practiceScores", index], "Each score needs ten unique ends (1–10)");
+      if (ends.total !== score.total) fail(["practiceScores", index, "total"], "Total does not match arrows");
+    });
+    const items = new Set(data.maintenanceItems.map((item) => item.id));
+    data.maintenanceChecks.forEach((check, index) => {
+      const match = /^item:(\d+)$/.exec(check.key);
+      if (match && !items.has(Number(match[1]))) fail(["maintenanceChecks", index, "key"], "Maintenance item is absent");
+    });
   }),
 });
 

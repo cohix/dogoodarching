@@ -3,10 +3,11 @@
  * export and import. Export omits `entries`; import accepts an `entries` key
  * from an old export file and ignores it.
  */
+import { uploadFile } from "./helpers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { api, apiJson, type Session } from "./helpers";
 import {
-  addItem, addScore, addSession, addSetup, checkItem, count, fileBody, parseContentDisposition, post, rows, setupAthletes, tracker,
+  addItem, addScore, addSession, addSetup, checkItem, count, parseContentDisposition, post, rows, setupAthletes, tracker,
 } from "./tracker-fixtures";
 
 afterEach(() => {
@@ -190,7 +191,7 @@ describe("export omits entries", () => {
 
   it("excludes uploaded files and keeps links", async () => {
     const { athlete } = await setupAthletes();
-    await post(athlete, "/api/plan/sessions/files", fileBody());
+    await (await uploadFile("/api/plan/sessions/files", athlete)).text();
     await post(athlete, "/api/plan/sessions/links", { dayKey: "wed", label: "Video", url: "https://example.org/v" });
 
     const file = await exportFor(athlete);
@@ -375,7 +376,7 @@ describe("import validation", () => {
   });
 });
 
-it("round-trips multiple D1 chunks of every unbounded collection, including wide setups and score ends", async () => {
+it("round-trips collections with wide setups and score ends", async () => {
   const { athlete } = await setupAthletes();
   await fillAccount(athlete);
   const file = await exportFor(athlete);
@@ -399,16 +400,16 @@ it("round-trips multiple D1 chunks of every unbounded collection, including wide
   expect(withoutIds(await exportFor(athlete))).toEqual(withoutIds(file));
 });
 
-it("rolls back earlier import chunks and deletes when a later chunk violates uniqueness", async () => {
+it("rejects duplicate natural keys before replacing data", async () => {
   const { athlete } = await setupAthletes();
   await fillAccount(athlete);
   const before = await exportFor(athlete);
   const file = structuredClone(before);
   file.data.trainingSessions = Array.from({ length: 40 }, (_, index) => ({ ...before.data.trainingSessions[0], id: index + 1, notes: "replacement" }));
   file.data.bowSetups = Array.from({ length: 30 }, (_, index) => ({ ...before.data.bowSetups[0], id: index + 1 }));
-  // The final collection's duplicate natural key fails after the wide inserts.
+  // Duplicate natural keys must fail preflight, not after destructive writes.
   file.data.weeklyNotes = [...file.data.weeklyNotes, ...file.data.weeklyNotes];
   const result = await importFor(athlete, file);
-  expect(result.status).toBe(500);
+  expect(result.status).toBe(400);
   expect(withoutIds(await exportFor(athlete))).toEqual(withoutIds(before));
 });

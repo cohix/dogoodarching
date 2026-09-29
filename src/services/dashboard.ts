@@ -1,6 +1,6 @@
 // The aggregate dashboard payload behind GET /api/tracker, and the aggregate
-// subset a coach may see. This is the only place private log rows are read
-// alongside plan data; the coach overview never includes them.
+// subset a coach may see. Plan and aggregate queries are shared; private log
+// rows are loaded only by the athlete dashboard.
 
 import { and, asc, desc, eq, gte, inArray, lt, or, sql } from "drizzle-orm";
 import { schema, type Db } from "../db";
@@ -10,7 +10,8 @@ import { attachmentUrl } from "./attachments";
 import { loadProgramState, plannedSessionDefaults } from "./plan";
 import { toSetup } from "./setups";
 
-export async function getTrackerPayload(db: Db, userId: string, today: string, before?: SessionCursor) {
+/** Shared coach-safe queries and formatting for both dashboard views. */
+async function loadPlanAndAggregates(db: Db, userId: string, today: string) {
   const state = await loadProgramState(db, userId, today);
   const calendarState = datedProgramState(state, today);
   const currentCycleStart = addUtcDays(mondayDate(today), -(calendarState.currentWeek - 1) * 7);
@@ -21,34 +22,13 @@ export async function getTrackerPayload(db: Db, userId: string, today: string, b
   // Group by the week's Monday in SQLite; use the shared ISO helper only to
   // format the bounded aggregate rows, including weeks across year boundaries.
   const weekStart = sql<string>`date(${training.sessionDate}, '-' || ((cast(strftime('%w', ${training.sessionDate}) as integer) + 6) % 7) || ' days')`;
-  const [weeklyPlanRows, plannedSessionRows, attachmentRows, sessions, practiceScores, weeklyRows, sessionDateRows, milestones, maintenance, maintenanceItemRows, setups, inspirationRows, weeklyNoteRows] = await Promise.all([
+  const [weeklyPlanRows, plannedSessionRows, attachmentRows, weeklyRows, sessionDateRows] = await Promise.all([
     db.select().from(schema.cycleWeekPlans).where(eq(schema.cycleWeekPlans.userId, userId)).orderBy(asc(schema.cycleWeekPlans.weekNumber)),
     db.select().from(schema.plannedSessionOverrides).where(eq(schema.plannedSessionOverrides.userId, userId)),
     db.select().from(schema.plannedSessionAttachments).where(eq(schema.plannedSessionAttachments.userId, userId)).orderBy(asc(schema.plannedSessionAttachments.id)),
-    db.select().from(training).where(and(eq(training.userId, userId), before
-      ? or(lt(training.sessionDate, before.sessionDate), and(eq(training.sessionDate, before.sessionDate), lt(training.id, before.id)))
-      : undefined)).orderBy(desc(training.sessionDate), desc(training.id)).limit(100),
-    db.select().from(schema.practiceScores).where(eq(schema.practiceScores.userId, userId)).orderBy(desc(schema.practiceScores.scoreDate), desc(schema.practiceScores.id)).limit(100),
     db.select({ weekStart, arrows: sql<number>`sum(${training.arrows})`.mapWith(Number) }).from(training).where(summaryRange).groupBy(weekStart),
     db.selectDistinct({ sessionDate: training.sessionDate }).from(training).where(summaryRange),
-    db.select().from(schema.milestoneChecks).where(eq(schema.milestoneChecks.userId, userId)),
-    db.select().from(schema.maintenanceChecks).where(eq(schema.maintenanceChecks.userId, userId)),
-    db.select().from(schema.maintenanceItems).where(eq(schema.maintenanceItems.userId, userId)).orderBy(asc(schema.maintenanceItems.sortOrder), asc(schema.maintenanceItems.id)),
-    db.select().from(schema.bowSetups).where(eq(schema.bowSetups.userId, userId)).orderBy(asc(schema.bowSetups.poundage)),
-    db.select().from(schema.inspirationEntries).where(eq(schema.inspirationEntries.userId, userId)).orderBy(desc(schema.inspirationEntries.updatedAt), desc(schema.inspirationEntries.id)),
-    db.select().from(schema.weeklyNotes).where(eq(schema.weeklyNotes.userId, userId)).orderBy(desc(schema.weeklyNotes.weekStart)),
   ]);
-  // At most 100 IDs, split to leave room for userId within D1's bind limit.
-  const scoreIds = practiceScores.map((score) => score.id);
-  const scoreIdGroups = [scoreIds.slice(0, 50), scoreIds.slice(50)].filter((ids) => ids.length > 0);
-  const practiceScoreEnds = (await Promise.all(scoreIdGroups.map((ids) =>
-    db.select().from(schema.practiceScoreEnds)
-      .where(and(eq(schema.practiceScoreEnds.userId, userId), inArray(schema.practiceScoreEnds.scoreId, ids)))
-      .orderBy(asc(schema.practiceScoreEnds.endNumber)),
-  ))).flat();
-  const currentWeekStart = mondayDate(today).toISOString().slice(0, 10);
-  const currentNote = weeklyNoteRows.find((row) => row.weekStart === currentWeekStart);
-  const historicalWeeklyNotes = weeklyNoteRows.filter((row) => row.weekStart < currentWeekStart && row.notes.trim());
   const weekly = new Map(weeklyRows.map((row) => [isoWeekKey(row.weekStart), row.arrows]));
   const sessionDates = new Set(sessionDateRows.map((row) => row.sessionDate));
   const todayDate = new Date(`${today}T12:00:00Z`);
@@ -103,6 +83,39 @@ export async function getTrackerPayload(db: Db, userId: string, today: string, b
       updatedAt: row.updatedAt.toISOString(),
     })),
     plannedSessions,
+    weeklyArrows: Array.from(weekly.entries()).sort(([a], [b]) => b.localeCompare(a)).slice(0, 8).reverse().map(([week, arrows]) => ({ week, arrows })),
+    cycleSummaries,
+  };
+}
+
+export async function getTrackerPayload(db: Db, userId: string, today: string, before?: SessionCursor) {
+  const training = schema.trainingSessions;
+  const [planAndAggregates, sessions, practiceScores, milestones, maintenance, maintenanceItemRows, setups, inspirationRows, weeklyNoteRows] = await Promise.all([
+    loadPlanAndAggregates(db, userId, today),
+    db.select().from(training).where(and(eq(training.userId, userId), before
+      ? or(lt(training.sessionDate, before.sessionDate), and(eq(training.sessionDate, before.sessionDate), lt(training.id, before.id)))
+      : undefined)).orderBy(desc(training.sessionDate), desc(training.id)).limit(100),
+    db.select().from(schema.practiceScores).where(eq(schema.practiceScores.userId, userId)).orderBy(desc(schema.practiceScores.scoreDate), desc(schema.practiceScores.id)).limit(100),
+    db.select().from(schema.milestoneChecks).where(eq(schema.milestoneChecks.userId, userId)),
+    db.select().from(schema.maintenanceChecks).where(eq(schema.maintenanceChecks.userId, userId)),
+    db.select().from(schema.maintenanceItems).where(eq(schema.maintenanceItems.userId, userId)).orderBy(asc(schema.maintenanceItems.sortOrder), asc(schema.maintenanceItems.id)),
+    db.select().from(schema.bowSetups).where(eq(schema.bowSetups.userId, userId)).orderBy(asc(schema.bowSetups.poundage)),
+    db.select().from(schema.inspirationEntries).where(eq(schema.inspirationEntries.userId, userId)).orderBy(desc(schema.inspirationEntries.updatedAt), desc(schema.inspirationEntries.id)),
+    db.select().from(schema.weeklyNotes).where(eq(schema.weeklyNotes.userId, userId)).orderBy(desc(schema.weeklyNotes.weekStart)),
+  ]);
+  // At most 100 IDs, split to leave room for userId within D1's bind limit.
+  const scoreIds = practiceScores.map((score) => score.id);
+  const scoreIdGroups = [scoreIds.slice(0, 50), scoreIds.slice(50)].filter((ids) => ids.length > 0);
+  const practiceScoreEnds = (await Promise.all(scoreIdGroups.map((ids) =>
+    db.select().from(schema.practiceScoreEnds)
+      .where(and(eq(schema.practiceScoreEnds.userId, userId), inArray(schema.practiceScoreEnds.scoreId, ids)))
+      .orderBy(asc(schema.practiceScoreEnds.endNumber)),
+  ))).flat();
+  const currentWeekStart = mondayDate(today).toISOString().slice(0, 10);
+  const currentNote = weeklyNoteRows.find((row) => row.weekStart === currentWeekStart);
+  const historicalWeeklyNotes = weeklyNoteRows.filter((row) => row.weekStart < currentWeekStart && row.notes.trim());
+  return {
+    ...planAndAggregates,
     sessions: sessions.map((row) => ({ id: row.id, sessionDate: row.sessionDate, sessionType: row.sessionType, customActivity: row.customActivity, arrows: row.arrows,
       durationMinutes: row.durationMinutes, focus: row.focus, score: row.score, notes: row.notes, createdAt: row.createdAt.toISOString() })),
     practiceScores: practiceScores.map((row) => ({
@@ -125,8 +138,6 @@ export async function getTrackerPayload(db: Db, userId: string, today: string, b
     historicalWeeklyNotes: historicalWeeklyNotes.map((row) => ({
       id: row.id, weekStart: row.weekStart, notes: row.notes, updatedAt: row.updatedAt.toISOString(),
     })),
-    weeklyArrows: Array.from(weekly.entries()).sort(([a], [b]) => b.localeCompare(a)).slice(0, 8).reverse().map(([week, arrows]) => ({ week, arrows })),
-    cycleSummaries,
     milestoneChecks: Object.fromEntries(milestones.map((row) => [row.key, row.checked])),
     maintenanceChecks: Object.fromEntries(maintenance.map((row) => [row.key, row.checked])),
     maintenanceItems: maintenanceItemRows.map((item) => ({
@@ -161,18 +172,7 @@ export async function getTrackerPayload(db: Db, userId: string, today: string, b
 
 export type TrackerPayload = Awaited<ReturnType<typeof getTrackerPayload>>;
 
-/**
- * The coach-visible subset of an athlete's dashboard. RBAC: only plans and
- * aggregates leave here — never sessions, practice scores, weekly notes,
- * setups, maintenance, or inspiration.
- */
+/** Only plan rows and bounded SQL aggregates are queried for coaches. */
 export async function getCoachOverview(db: Db, athleteId: string, today: string) {
-  const payload = await getTrackerPayload(db, athleteId, today);
-  return {
-    state: payload.state,
-    weeklyPlans: payload.weeklyPlans,
-    plannedSessions: payload.plannedSessions,
-    weeklyArrows: payload.weeklyArrows,
-    cycleSummaries: payload.cycleSummaries,
-  };
+  return loadPlanAndAggregates(db, athleteId, today);
 }

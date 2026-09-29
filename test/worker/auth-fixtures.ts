@@ -2,6 +2,7 @@
  * Extra fixtures for the auth / invite / RBAC / team tests. Extends
  * `helpers.ts` without modifying it.
  */
+import { uploadFile } from "./helpers";
 import { env } from "cloudflare:test";
 import { sha256Hex } from "../../src/lib/auth";
 import { acceptInvite, api, apiJson, bootstrapCoach, createInvite, DEFAULT_PASSWORD, type Session } from "./helpers";
@@ -89,14 +90,18 @@ export function filePayload(overrides: Record<string, unknown> = {}) {
 
 /** Athlete uploads a plan file for themselves; returns the attachment id. */
 export async function uploadOwnFile(session: Session, overrides: Record<string, unknown> = {}): Promise<number> {
-  const { status, body } = await apiJson<{ id: number }>("/api/plan/sessions/files", { json: filePayload(overrides), cookie: session.cookie });
+  const response = await uploadFile("/api/plan/sessions/files", session, filePayload(overrides));
+  const status = response.status;
+  const body = await response.json() as { id: number };
   if (status !== 200) throw new Error(`upload failed: ${status} ${JSON.stringify(body)}`);
   return body.id;
 }
 
 /** Coach uploads a plan file for an athlete; returns the attachment id. */
 export async function uploadFileForAthlete(coach: Session, athleteId: string, overrides: Record<string, unknown> = {}): Promise<number> {
-  const { status, body } = await apiJson<{ id: number }>(`/api/coach/athletes/${athleteId}/plan/sessions/files`, { json: filePayload(overrides), cookie: coach.cookie });
+  const response = await uploadFile(`/api/coach/athletes/${athleteId}/plan/sessions/files`, coach, filePayload(overrides));
+  const status = response.status;
+  const body = await response.json() as { id: number };
   if (status !== 200) throw new Error(`coach upload failed: ${status} ${JSON.stringify(body)}`);
   return body.id;
 }

@@ -25,12 +25,19 @@ export default defineConfig({
           // workerd cannot). The migrations are passed to the Worker as the
           // test-only `TEST_MIGRATIONS` binding and applied per test file by
           // test/worker/setup.ts.
+          //
+          // `RATE_LIMIT_MODE` is the test-only mock switch for
+          // src/lib/rate-limit.ts: "allow" makes every limiter admit the
+          // request, so suites that log in many times never hit 429. A test
+          // sets `env.RATE_LIMIT_MODE` to "deny", "deny:<key prefix>" or
+          // "error" to force those paths (see test/worker/auth-rate-limit.test.ts).
+          // Outside this mock a missing/erroring binding fails closed (503).
           cloudflareTest(async () => {
             const migrations = await readD1Migrations(`${repoRoot}migrations`);
             return {
               wrangler: { configPath: `${repoRoot}wrangler.toml` },
               miniflare: {
-                bindings: { TEST_MIGRATIONS: migrations },
+                bindings: { TEST_MIGRATIONS: migrations, RATE_LIMIT_MODE: "allow" },
               },
             };
           }),
@@ -40,8 +47,8 @@ export default defineConfig({
           root: repoRoot,
           include: ["test/worker/**/*.test.ts"],
           setupFiles: ["test/worker/setup.ts"],
-          // PBKDF2 at 210k iterations runs on every bootstrap/login/accept;
-          // keep headroom for slow CI runners.
+          // PBKDF2 at 100k iterations (the hosted Workers cap) runs on every
+          // bootstrap/login/accept; keep headroom for slow CI runners.
           testTimeout: 30_000,
           hookTimeout: 30_000,
         },

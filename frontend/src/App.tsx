@@ -1,9 +1,10 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { InviteAcceptScreen, AuthScreen } from "./features/auth/AuthScreen";
 import { useQueryClient, useQuery, useMutation } from "@tanstack/react-query";
 import { api, ApiError, type Me } from "./api";
 import { type Tab, coachNav, athleteNav } from "./components/navigation";
 import { localDate } from "./lib/dates";
+import { resetAccount } from "./lib/account";
 import { Dashboard } from "./features/dashboard/Dashboard";
 import { TrainingLog } from "./features/log/TrainingLog";
 import { TrainingPlan } from "./features/plan/TrainingPlan";
@@ -15,7 +16,14 @@ import { CycleHistoryModal } from "./features/dashboard/CycleHistoryModal";
 
 const inviteTokenFromPath = (): string | null => {
   const match = window.location.pathname.match(/^\/invite\/([^/]+)\/?$/);
-  return match?.[1] ? decodeURIComponent(match[1]) : null;
+  const encoded = /^\/invite\/?$/.test(window.location.pathname)
+    ? window.location.hash.slice(1)
+    : match?.[1];
+  if (!encoded) return null;
+  // Capture before scrubbing both fragment links and legacy path links. The
+  // latter have already reached the server once; new fragments never do.
+  window.history.replaceState(null, "", "/invite");
+  try { return decodeURIComponent(encoded); } catch { return null; }
 };
 
 export function App() {
@@ -34,7 +42,23 @@ export function App() {
 
 function AuthGate() {
   const qc = useQueryClient();
-  const meQuery = useQuery({ queryKey: ["me"], queryFn: () => api.me(), retry: false });
+  const meQuery = useQuery<Me | null>({ queryKey: ["me"], queryFn: () => api.me(), retry: false });
+  const accountId = meQuery.data?.id;
+  useEffect(() => {
+    if (!accountId) return;
+    // A revoked/deactivated session can first fail on any authenticated read
+    // or write. Clear private data and unmount account forms immediately.
+    const onError = (error: unknown) => {
+      if (error instanceof ApiError && error.status === 401) resetAccount(qc);
+    };
+    const queries = qc.getQueryCache().subscribe((event) => {
+      if (event.type === "updated" && event.action.type === "error") onError(event.query.state.error);
+    });
+    const mutations = qc.getMutationCache().subscribe((event) => {
+      if (event.type === "updated" && event.action.type === "error") onError(event.mutation.state.error);
+    });
+    return () => { queries(); mutations(); };
+  }, [qc, accountId]);
   if (meQuery.isPending) return <div className="min-h-screen bg-[var(--bg)] p-6 pt-safe text-sm text-[var(--dim)]">Loading…</div>;
   if (meQuery.error) {
     if (meQuery.error instanceof ApiError && meQuery.error.status === 401) {
@@ -46,7 +70,7 @@ function AuthGate() {
     </div>;
   }
   if (!meQuery.data) return <AuthScreen onAuthed={() => qc.invalidateQueries({ queryKey: ["me"] })} />;
-  return <TrackerShell me={meQuery.data} />;
+  return <TrackerShell key={meQuery.data.id} me={meQuery.data} />;
 }
 
 function TrackerShell({ me }: { me: Me }) {
@@ -75,7 +99,7 @@ function TrackerShell({ me }: { me: Me }) {
       {tab === "plan" && <TrainingPlan data={data} onSaved={refresh} onCheck={(key, checked) => check.mutate({ group: "milestone", key, checked })} />}
       {tab === "bow" && <BowAndGear data={data} onSaved={refresh} />}
       {tab === "nutrition" && <Nutrition recipes={data.recipes} />}
-      {tab === "team" && <TeamTab me={me} />}
+      {tab === "team" && <TeamTab key={`${me.id}:${me.isOwner}`} me={me} />}
       {tab === "settings" && <SettingsTab me={me} />}
     </main>
     {cycleHistoryOpen && <CycleHistoryModal summaries={data.cycleSummaries.filter((summary) => summary.cycle < data.state.currentCycle)} onClose={() => setCycleHistoryOpen(false)} />}

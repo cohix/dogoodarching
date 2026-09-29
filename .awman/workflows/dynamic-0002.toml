@@ -1,0 +1,1184 @@
+# awman workflow for work item 0002: security hardening (REVIEW.md C2, H2-H5,
+# M1-M4, M6). Project: Do Good Arching (Cloudflare Workers + D1 + R2, Hono,
+# Drizzle, React SPA; Vitest 4 with @cloudflare/vitest-plugin).
+#
+# Shape of the run
+#   setup: npm ci
+#   auth-and-rate-limits (§1 C2, §6 M2) ─┐   coach-overview (§8 M4, dashboard.ts only)
+#   request-hardening    (§4, §5, §9)  ◄─┴──────────────┘
+#   lifecycle            (§7 M3 backend, cleanup records, cron)
+#   uploads              (§3 H4 backend, upload errors §9)
+#     ├── import-hardening (§2 H2+H3)         ├── frontend (§3/§5/§7 UI)
+#     │     ├── tests-security-auth           │     └── tests-frontend
+#     │     └── tests-data-paths              │
+#     └──── docs (README + aspec) ◄───────────┘
+#   review-backend + review-frontend-docs  (independent reviewers, findings only)
+#   remediate  ->  verify-remediation (abort on failure)
+#   teardown: typecheck + lint + docs:check + db:check + tests + build, commit, push, PR
+#
+# The backend implementation steps form one sequential chain because they share
+# src/lib/*, src/routes/*, src/db/schema.ts, migrations/, wrangler.toml and the
+# test helpers. Each step in the chain may generate its own drizzle-kit
+# migration (next number in sequence). Agents alternate between claude and
+# codex so that work is tested and reviewed by a different assistant than the
+# one that wrote it. No models are set: the agent listing names none, so the
+# repo default applies.
+
+title = "0002 Security hardening"
+teardown_on_failure = false
+
+# Every agent step gets the run-scoped shared context directory.
+overlays = ["context(workflow)"]
+
+# ── Setup ─────────────────────────────────────────────────────────────────────
+
+[[setup]]
+type = "run_shell"
+command = "npm ci"
+abort_on_failure = true
+
+# ── Agent steps ───────────────────────────────────────────────────────────────
+
+[[step]]
+name = "auth-and-rate-limits"
+agent = "claude"
+prompt = '''
+You are working on work item {{work_item_number}} (security hardening) in the Do
+Good Arching repository (Cloudflare Workers + D1 + R2, Hono, Drizzle, React SPA;
+read README.md, REVIEW.md findings C2 and M2, and aspec/architecture/security.md
+first). This is the FIRST step of the backend chain. It delivers work item
+sections 1 (PBKDF2 iteration count, C2, the production blocker) and 6
+(brute-force protection with Workers Rate Limiting bindings, M2).
+
+Current code: `src/lib/auth.ts` (PBKDF2_ITERATIONS = 210000, `hashPassword`,
+`verifyPassword`, cookie helpers), `src/services/auth.ts` (login/bootstrap/
+invite persistence), `src/lib/rate-limit.ts` (D1 limiter: `clientIp`,
+`checkRateLimit`, `rateLimit` middleware), `src/routes/auth.ts` (uses
+`rateLimit(keyFor, max, windowMs)`), `src/db/index.ts` (`Env`),
+`src/db/schema.ts` + `migrations/` (drizzle-kit; `rate_limits` table),
+`wrangler.toml`, `vitest.config.ts`, `test/worker/helpers.ts`,
+`test/worker/auth-rate-limit.test.ts`.
+
+DO:
+1. Section 1 (C2), exactly as specified: lower PBKDF2_ITERATIONS to 100,000;
+   `verifyPassword` reads the count from the stored `pbkdf2$<n>$salt$hash`;
+   define and document a minimum supported count (export the constants); reject
+   non-integer/malformed counts, counts below the floor or above 100,000, salts
+   other than 16 bytes and hashes other than 32 bytes; malformed or empty fields
+   fail authentication without throwing and without zero-length comparisons.
+   On successful login with a supported lower count, rehash and update
+   `password_hash` conditioned on the exact hash that was verified (`UPDATE ...
+   WHERE id = ? AND password_hash = ?`) so a concurrent password change is never
+   overwritten. Keep comparable password-work cost for unknown users and wrong
+   passwords. No local-only 210k exception: 210k hashes fail safely everywhere
+   and use the operator reset runbook (the docs step updates the runbook; you
+   write the facts it needs in your handoff). Update the comment in
+   `vitest.config.ts` that mentions 210k.
+2. Section 6 (M2). Replace the D1 limiter with Workers Rate Limiting bindings:
+   - `wrangler.toml`: declare `[[ratelimits]]` and `[[env.preview.ratelimits]]`
+     with separate 5/min and 10/min bindings (or one per operation) and distinct
+     `namespace_id`s for production and preview. Period must be 60 (or 10).
+   - `src/db/index.ts`: add the bindings to `Env` with a `RateLimit`-style type
+     (`{ limit(options: { key: string }): Promise<{ success: boolean }> }`).
+   - `src/lib/rate-limit.ts`: keep `rateLimit(...)` as the shared middleware
+     interface (routes never call bindings directly); adapt `checkRateLimit`
+     behind it to select the binding by operation and prefix keys. A missing
+     binding or a binding error must FAIL CLOSED with a generic `{ error }` 503/500
+     style service error, never silently disable limiting. Remove the
+     `X-Forwarded-For` fallback from `clientIp`.
+   - Starting limits: login per IP 10/min; login per normalized username
+     (`login-user:<lower(username)>`) 5/min, checked after validation and before
+     hashing with no user lookup; accept-invite per IP 10/min; bootstrap per IP
+     5/min; invite creation per coach 10/min. Export a helper the later lifecycle
+     and uploads steps can reuse for "uploads per acting user 10/min" and a short
+     per-acting-user limit on password verification.
+   - Drop the `rate_limits` table: remove it from `src/db/schema.ts` and generate
+     a new migration with `npm run db:generate` (next number after
+     `0002_team_auth.sql`; never edit 0001/0002). `npm run db:check` must pass.
+   - Tests: the binding is not a plain serialisable value, so provide an explicit
+     local/test mock. Recommended: the limiter resolves the binding through a
+     small injectable seam (for example a test-only `RATE_LIMIT_MODE` binding or
+     an overridable factory) so tests can force allow, deny and error paths
+     deterministically; document clearly that outside explicit test/local mocks a
+     missing binding fails closed. Rewrite `test/worker/auth-rate-limit.test.ts`
+     for the new behaviour (429 when the mock denies; both per-IP and
+     per-username keys are checked on login; fail-closed when the binding is
+     missing/erroring), update the header comment and `resetStorage` in
+     `test/worker/helpers.ts` (no `rate_limits` table any more), and make sure the
+     existing suites that log in many times per test still pass under the mock.
+3. Keep every route thin and preserve `{ error: string }` bodies and existing
+   status codes. Preserve 0001's atomic bootstrap and invite-accept batches.
+
+DO NOT:
+- Do not implement sections 2, 3, 4, 5, 7, 8 or 9 (CSRF, headers, uploads,
+  import, lifecycle, coach overview, error class): later steps own them.
+- Do not touch `frontend/`, `aspec/`, `README.md` or `.awman/`.
+- Do not edit `src/services/dashboard.ts`: another agent is rewriting it right
+  now (coach overview). If `npm run test:worker` shows failures only in a
+  coach-overview test file or in dashboard code, that is the other agent's
+  in-flight work; retry after a short wait and otherwise ignore it.
+- Do not write the comprehensive test suite; add only the tests you need to
+  prove the hashing rules and the limiter mock work on D1/workerd. The test
+  steps write the full matrix later.
+
+Success criteria you can check yourself:
+- `npm run typecheck`, `npm run lint`, `npm run db:check` and `npm run test:worker`
+  pass (ignoring only in-flight coach-overview noise as described).
+- `grep -rn "210000\|x-forwarded-for" src` finds nothing; `grep -rn "rate_limits" src migrations/*.sql`
+  finds only the DROP in your new migration.
+- A stored hash with count 100000 verifies; a stored hash with a supported lower
+  count verifies and is upgraded exactly once; `pbkdf2$210000$...`, `pbkdf2$abc$..`,
+  a 3-part string and an empty string all return false without throwing.
+- `npx wrangler deploy --dry-run --env preview` (and without `--env`) parses the
+  new bindings; if the dry run needs credentials, at least confirm the config parses.
+
+Before finishing, write `/awman/context/workflow/01-auth-rate-limits.md` for later
+steps: the hash format and constants (floor, max), the rehash-on-login rule, the
+exact operator-reset facts (what SQL/steps an operator runs to set a new 100k hash
+and revoke sessions while keeping data and owner status), the rate-limit binding
+names, how `rateLimit(...)` is now called, how to reuse it for uploads and
+password-verification endpoints, how the test mock is enabled and how a test
+forces deny/error, and any quirk you hit with the vitest plugin.
+
+Work item (full text; also at aspec/work-items/{{work_item_number}}-security-hardening.md):
+{{work_item_content}}
+'''
+
+[[step]]
+name = "coach-overview"
+agent = "codex"
+prompt = '''
+You are working on work item {{work_item_number}} (security hardening) in the Do
+Good Arching repository. This step delivers section 8 (coach overview privacy,
+REVIEW.md M4) and nothing else. It runs in parallel with another agent that is
+editing auth, rate limiting, migrations and wrangler.toml, so your file footprint
+must stay tiny.
+
+DO:
+- Rewrite `getCoachOverview(db, athleteId, today)` in `src/services/dashboard.ts`
+  so it only QUERIES program state, cycle week plans, planned session overrides,
+  attachments, and SQL aggregates of arrows per week and distinct session dates.
+  It must never select private log columns (session `notes`, `focus`, `score`)
+  and never query practice scores, weekly notes, gear/setups, maintenance or
+  inspiration tables. Remove its internal call to `getTrackerPayload`. Reuse the
+  shared plan/aggregate helpers that `getTrackerPayload` already uses (extract a
+  helper if needed, inside `src/services/dashboard.ts` or `src/services/plan.ts`),
+  keep 0001's bounded date ranges, null-poundage/default handling and the
+  existing five-field response contract exactly (the coach route in
+  `src/routes/coach.ts` already calls this service; `frontend/src/api.ts` types
+  the response). Aggregates must match what the athlete dashboard shows.
+- Add ONE proof test file, `test/worker/coach-overview.test.ts`, that seeds an
+  athlete with distinctive strings in notes/focus/score/weekly notes/setups/
+  inspiration and asserts (a) the coach overview body contains none of them and
+  (b) the queries executed by `getCoachOverview` never reference the private
+  tables/columns. For (b), call the service directly with a Drizzle instance
+  wrapped by a logger (`drizzle(env.DB, { schema, logger })`) or a D1 proxy that
+  records SQL, and assert on the captured statements. A response-only test is
+  not enough: it passes the current vulnerable implementation.
+
+DO NOT:
+- Do not edit any file other than `src/services/dashboard.ts`, optionally
+  `src/services/plan.ts` for a shared helper, and your new test file. Do not
+  touch `src/routes/*`, `src/lib/*`, `src/db/*`, `migrations/`, `wrangler.toml`,
+  `vitest.config.ts`, `test/worker/helpers.ts`, `frontend/`, `aspec/`, `.awman/`.
+- Do not run the whole worker suite as your gate. The other agent is changing
+  migrations, wrangler.toml and the test helpers; run only your file
+  (`npx vitest run --project worker test/worker/coach-overview.test.ts`) and the
+  existing `test/worker/rbac.test.ts` and `test/worker/tracker-*.test.ts` files that
+  cover the coach route, retrying after a short wait if a failure clearly comes
+  from the concurrent auth/rate-limit work (missing binding, migration churn).
+
+Success criteria:
+- `npx tsc --noEmit -p tsconfig.worker.json` and `npm run lint` pass.
+- `grep -n "getTrackerPayload" src/services/dashboard.ts` shows only its
+  definition and no call inside `getCoachOverview`.
+- Your test proves both the body and the query projections are clean, and the
+  coach overview numbers equal the athlete dashboard's for the same seed data.
+
+Before finishing, write `/awman/context/workflow/02-coach-overview.md`: which
+helpers you extracted, the exact queries the overview now runs, and how the
+query-capture assertion works so the later test and review steps can reuse it.
+
+Work item (full text; also at aspec/work-items/{{work_item_number}}-security-hardening.md):
+{{work_item_content}}
+'''
+
+[[step]]
+name = "request-hardening"
+agent = "codex"
+depends_on = ["auth-and-rate-limits", "coach-overview"]
+prompt = '''
+You are working on work item {{work_item_number}} (security hardening) in the Do
+Good Arching repository. Read `/awman/context/workflow/01-auth-rate-limits.md`
+first. This step delivers section 4 (CSRF, H5), section 5 (security headers and
+the invite-token fragment, M1) and the shared part of section 9 (the
+`UserFacingError` class and `jsonError` status union, M6).
+
+DO:
+1. CSRF (section 4), `src/index.ts`, `src/lib/http.ts`, `src/lib/auth.ts`:
+   - Add an explicit same-origin guard for ALL unsafe `/api/*` requests (any
+     method other than GET/HEAD/OPTIONS), covering JSON, raw upload bodies and
+     bodyless logout/delete. Mounting Hono's csrf middleware alone is not enough
+     (it only checks form content types); you may add it, but the explicit guard
+     is required. Rules: a present Origin that mismatches, or is `null`, gets 403;
+     an exact same-origin Origin passes; a missing Origin passes only with
+     `Sec-Fetch-Site: same-origin`; neither proof gets 403. Same-site siblings are
+     not same-origin. Errors stay `{ error: string }`. Derive the expected origin
+     from the request URL (Host/proto as the Worker sees it); document how the
+     local Vite dev proxy still passes. If the installed PWA on iOS/Android
+     could send neither header, add a verified CSRF-token flow rather than
+     failing open; document your decision and evidence.
+   - `validateJson` rejects a missing or non-JSON `Content-Type` with 415 BEFORE
+     parsing, accepting `application/json` with an optional charset. Only JSON
+     endpoints use it; bodyless endpoints stay usable; malformed JSON stays 400.
+   - Session cookie: `SameSite=Strict` (invite links do not need Lax).
+2. Security headers (section 5):
+   - `frontend/public/_headers` with the exact CSP from the work item
+     (`default-src 'self'; img-src 'self' blob: data:; frame-src
+     https://www.youtube.com https://www.youtube-nocookie.com
+     https://player.vimeo.com; object-src 'none'; base-uri 'none';
+     frame-ancestors 'none'`), `Referrer-Policy: no-referrer`,
+     `Strict-Transport-Security: max-age=31536000; includeSubDomains`,
+     `X-Content-Type-Options: nosniff` and a `Permissions-Policy` disabling unused
+     features. Confirm Vite copies `frontend/public/` into `dist/client` and that
+     Workers Static Assets honours `_headers`. Check the built SPA under the CSP
+     (Vite output, the service worker, YouTube/Vimeo embeds, React inline styles,
+     Recharts): add only the narrow `style-src` allowance actually needed and never
+     relax script restrictions; record what you tested and how.
+   - Equivalent headers on every `/api/*` response via `hono/secure-headers`
+     (plus the CSP/Referrer/HSTS values above), applied so that error responses
+     (404, 500 from `onError`) and direct `Response` downloads also carry them.
+   - Invite token to fragment: `invitePath` in `src/routes/auth.ts` becomes
+     `/invite#<token>`; `inviteTokenFromPath` in `frontend/src/App.tsx` reads the
+     fragment AND still accepts legacy `/invite/<token>` paths, immediately
+     calling `replaceState` to remove the token in both cases; update the comment
+     in `frontend/sw.js` and check `scripts/service-worker-cache.mjs` and the
+     service worker's navigation handling do not strip or cache fragments. Keep
+     24-hour expiry and single-use semantics and owner validation of coach invites.
+3. Section 9 shared part, `src/lib/http.ts`: add `UserFacingError` (public
+   message + HTTP status) and extend `jsonError`'s status union (add 413, 415,
+   500 and whatever the CSRF/limiter paths need). Add an `onError` mapping in
+   `src/index.ts`: `UserFacingError` -> its status and message; anything else ->
+   generic 500 `{ error: "Internal server error" }` logged with `console.error`
+   without passwords, raw tokens or request bodies. Applying the class to upload
+   errors is done by the uploads step.
+4. Tests and helpers: existing tests send no Origin, so make `api()` in
+   `test/worker/helpers.ts` send `Origin: http://example.com` by default with an
+   option to override/remove it, and keep the whole worker suite green. Add
+   focused proof tests (for example `test/worker/csrf.test.ts` and
+   `test/worker/headers.test.ts`) for: cross-site, sibling-site and `null`
+   Origin -> 403 on JSON, upload and bodyless endpoints; missing Origin with
+   `Sec-Fetch-Site: same-origin` passes; neither proof -> 403; `text/plain` or
+   missing content type on a JSON endpoint -> 415; malformed JSON -> 400;
+   `application/json; charset=utf-8` succeeds; headers present on 200, 404, 500
+   and a file download; `invitePath` uses the fragment. Update
+   `test/frontend/*` only where the invite-path change breaks an existing test.
+
+DO NOT:
+- Do not implement sections 2, 3, 7 or 8, and do not touch `src/services/*`
+  except `src/services/attachments.ts` if a download `Response` needs the headers.
+- Do not change `frontend/src/api.ts` (browsers send Origin on POST; the
+  frontend step owns that file) and do not touch `aspec/`, `README.md` or `.awman/`.
+- Do not weaken or skip existing tests to get green.
+
+Success criteria:
+- `npm run typecheck`, `npm run lint`, `npm run db:check`, `npm test` and
+  `npm run build` pass, and `dist/client/_headers` exists after the build.
+- `grep -rn "SameSite=Lax" src` finds nothing; `grep -rn '/invite/\${' src` finds nothing.
+- Every proof scenario listed above has a passing test.
+
+Before finishing, write `/awman/context/workflow/03-request-hardening.md`: the
+exact CSRF rules and where the guard lives, what the test helper now sends and how
+to send a cross-site request in a test, the header set and the `style-src`
+decision with evidence, the `UserFacingError` / `jsonError` API and how later
+steps should raise expected 400/413/415 errors, the PWA no-Origin decision, and
+the invite fragment behaviour for the frontend and docs steps.
+
+Work item (full text; also at aspec/work-items/{{work_item_number}}-security-hardening.md):
+{{work_item_content}}
+'''
+
+[[step]]
+name = "lifecycle"
+agent = "claude"
+depends_on = ["request-hardening"]
+prompt = '''
+You are working on work item {{work_item_number}} (security hardening) in the Do
+Good Arching repository. Read `/awman/context/workflow/01-auth-rate-limits.md` and
+`/awman/context/workflow/03-request-hardening.md` first. This step delivers the
+BACKEND of section 7 (account and session lifecycle, M3): password change,
+logout-all, account deletion, athlete deactivation/reactivation, ownership
+transfer, scheduled cleanup with Cron Triggers, and the durable pending-blob
+cleanup records that the later uploads and import steps will also write to.
+The Settings/Team UI is done by a later frontend step.
+
+Current code: `src/services/auth.ts`, `src/services/team.ts`, `src/lib/rbac.ts`
+(`authMiddleware`, `resolveAthlete`, `c.get("sessionId")`), `src/routes/auth.ts`,
+`src/routes/coach.ts`, `src/db/schema.ts` (partial unique owner index, FKs with
+ON DELETE CASCADE / SET NULL), `src/index.ts`, `wrangler.toml`.
+
+DO:
+1. Schema, one new drizzle-kit migration (`npm run db:generate`, next number; never
+   edit applied migrations): `users.deactivated_at` (nullable `timestamp_ms`);
+   a durable blob-cleanup table (pending R2 keys with attempts/last error, NOT
+   foreign-keyed to users so records survive user deletion). Keep FK and owner
+   index invariants; update the explicit-column invite-accept insert in
+   `src/services/auth.ts` for the changed user schema while retaining the
+   `changes() = 1` guard and concurrent-claim protection. `npm run db:check` passes.
+2. Endpoints, thin routes with `validateJson` + shared schemas in `src/lib/validation.ts`
+   and logic in services:
+   - `POST /api/auth/password` `{ currentPassword, newPassword }`: verify current
+     password, then atomically (one `db.batch`) update the hash conditioned on the
+     hash that was verified and delete every other session, keeping
+     `c.get("sessionId")`; stale verification -> 409.
+   - `POST /api/auth/logout-all`: delete all the user's sessions, clear the cookie.
+   - `DELETE /api/auth/account` `{ password }`: owner -> 409 "Transfer ownership
+     before deleting your account"; last active coach -> 409 (explicit check);
+     otherwise one batch deletes the user (cascades) and inserts cleanup records
+     for every R2 key the user's own attachments referenced; clear the cookie
+     immediately; attempt cleanup promptly via `waitUntil` AND rely on the
+     scheduled job for retries. Never delete R2 before the DB commit. Deleting a
+     non-owner coach leaves athletes and coach-uploaded files intact, nulls
+     `invited_by`/`created_by`, keeps unexpired athlete invites usable; creatorless
+     coach invites stay unusable. Guards for owner/last-coach must be atomic
+     inside the batch (conditional delete), not just a pre-read.
+   - `POST /api/coach/athletes/:athleteId/deactivate` (sets `deactivated_at` and
+     deletes that athlete's sessions in one batch) and `.../reactivate`; both
+     idempotent; `resolveAthlete` still matches athletes only (coach -> 404).
+   - `authMiddleware` rejects deactivated users (401). Login for a deactivated
+     user returns the generic "Invalid username or password" with comparable
+     password work. Guard session creation against login/deactivation races
+     (insert the session conditioned on `deactivated_at IS NULL`).
+   - `GET /api/coach/athletes` excludes deactivated athletes by default;
+     `?include=deactivated` includes them with a flag. Coach plan endpoints keep
+     working for deactivated athletes. Usernames stay reserved.
+   - `POST /api/auth/owner/transfer` `{ coachId, password }`: owner only; target
+     must be an active coach; one `db.batch` clears `is_owner` on the caller only
+     if a valid target exists and the caller is still owner, then sets it on the
+     target conditioned on the clear having happened; if the second update
+     changes zero rows, the batch must not leave zero owners (design the
+     statements so that cannot happen, for example by making the clear itself
+     conditional on the target row's eligibility via a subquery and the set
+     conditional on the caller now being non-owner and the target still eligible,
+     then verifying `changes()` and returning 409 on a stale transfer). Prove with
+     a test that concurrent transfers/deletes leave exactly one owner.
+   - Add the short per-acting-user rate limit from the shared limiter to
+     password verification in the password/delete/transfer endpoints.
+   - Add `isOwner`/deactivated info to `/api/auth/me` and `publicUser` as needed
+     without breaking existing response fields.
+3. Scheduled cleanup: Cron Triggers in `wrangler.toml` for production and preview
+   (document the UTC schedule in a comment) and a `scheduled` handler in
+   `src/index.ts` that, in bounded batches: deletes expired `sessions`; deletes
+   invites used more than 30 days ago or unused and expired more than 30 days
+   ago; retries pending R2 deletions idempotently, removing a record only after
+   success and never deleting a key that is still referenced by an attachment
+   row. Put the job logic in a service (for example `src/services/cleanup.ts`)
+   with an exported function that tests can call directly with `env`, and an
+   exported helper `enqueueBlobCleanup(...)`-style API that returns the
+   statements to include in a caller's batch, for the uploads and import steps.
+4. Update `test/worker/helpers.ts` `resetStorage` if needed for the new tables,
+   and add proof tests (for example `test/worker/lifecycle.test.ts`) covering:
+   password change keeps the current session and revokes others; logout-all;
+   account deletion rules (owner 409, last coach 409, non-owner coach deletion
+   preserves athletes and their invites); deactivate/reactivate incl. 401 on the
+   next request, hidden by default, `?include=deactivated`, idempotency, coach
+   target 404; ownership transfer happy path and invalid targets; scheduled
+   cleanup boundaries. The test step adds the full matrix later; keep yours
+   focused but real.
+
+DO NOT:
+- Do not touch `frontend/`, `aspec/`, `README.md` or `.awman/`.
+- Do not implement sections 2 or 3 (import, uploads) beyond exposing the cleanup
+  API; do not change `src/services/dashboard.ts` or `src/services/transfer.ts`.
+- Never use `db.transaction()`; never separate awaited parent/child writes where
+  atomicity is required.
+
+Success criteria:
+- `npm run typecheck`, `npm run lint`, `npm run db:check`, `npm test` and
+  `npm run build` pass.
+- `npx wrangler deploy --dry-run --env preview` accepts the cron trigger config
+  (or at least the config parses).
+- After any sequence of transfer/delete calls in your tests,
+  `SELECT count(*) FROM users WHERE is_owner = 1` is exactly 1.
+
+Before finishing, write `/awman/context/workflow/04-lifecycle-api.md`: every
+endpoint added or changed (method, path, body, response, status codes), the
+deactivation and ownership rules as implemented, the cleanup-record API and how
+callers include it in their batch, the cron schedule, the migration's decisions,
+and anything the frontend, uploads, import, docs and test steps must know.
+
+Work item (full text; also at aspec/work-items/{{work_item_number}}-security-hardening.md):
+{{work_item_content}}
+'''
+
+[[step]]
+name = "uploads"
+agent = "codex"
+depends_on = ["lifecycle"]
+prompt = '''
+You are working on work item {{work_item_number}} (security hardening) in the Do
+Good Arching repository. Read `/awman/context/workflow/01-auth-rate-limits.md`,
+`/awman/context/workflow/03-request-hardening.md` and
+`/awman/context/workflow/04-lifecycle-api.md` first. This step delivers the
+BACKEND of section 3 (file uploads, H4) and the upload part of section 9 (error
+leakage, M6). The frontend transport change is done by a later step from the
+contract you write down.
+
+Current code: `src/services/attachments.ts` (`addPlannedSessionFileFor` decodes
+base64 from JSON, 8,000,000-byte cap, `fileDownloadHeaders`,
+`buildContentDisposition` in `src/lib/http.ts`), upload routes in
+`src/routes/tracker.ts` and `src/routes/coach.ts`, schemas in
+`src/lib/validation.ts`, `src/db/schema.ts` + `migrations/`.
+
+DO:
+1. Transport: replace base64-in-JSON with a raw file body plus validated metadata
+   in headers/query (recommended: `PUT`/`POST` with the file as the body,
+   `Content-Type` = file MIME, metadata such as label/dayKey in query or `X-`
+   headers), or genuinely streaming multipart parsing. Do NOT buffer the whole
+   file via `formData()`/`arrayBuffer()`. Reject a declared oversize
+   `Content-Length` before reading; also count actual streamed bytes with a
+   `TransformStream`, enforce the 8,000,000-byte cap mid-stream, and reject
+   truncated/mismatched bodies. Define the missing-`Content-Length` path
+   explicitly (R2 `put` needs a known length for streams: either require the
+   header, or use a fixed-length/`FixedLengthStream` design, or buffer only up to
+   the cap in bounded chunks; document the choice and its memory bound). Browser
+   code must not set `Content-Length` itself; verify the chosen transport works
+   with a browser `File` body. The upload route must carry its own content-type
+   validation (it does not use `validateJson`) and still pass the CSRF guard.
+2. MIME allowlist in ONE shared constant in `src/lib/validation.ts`: `image/jpeg`,
+   `image/png`, `image/webp`, `image/heic`, `application/pdf` and the exact
+   office document types (doc, docx, xls, xlsx, ppt, pptx). Normalize MIME
+   metadata (lowercase, strip parameters) before validation; store the safe
+   effective MIME; serve anything else stored as `application/octet-stream`;
+   use the effective MIME for both download headers and the filename builder.
+3. Quotas per target user, excluding links: 100 files and 500,000,000 bytes.
+   Personal uploads count against the uploader; coach uploads count against the
+   athlete. 413 with a message naming the limit hit. Enforce admission
+   ATOMICALLY with a reservation row or conditional write (a standalone
+   SUM/COUNT precheck is not acceptable); release failed reservations; clean up
+   blobs whose D1 commit fails via the lifecycle step's cleanup-record API;
+   in-flight uploads must recheck the actor's active state and must not leave an
+   untracked blob if the account is deleted mid-upload.
+4. Schema, one new drizzle-kit migration: `attachments.size_bytes` (nullable
+   until backfilled) and an upload-reservation table (include abandoned
+   reservations in the scheduled cleanup). Provide an idempotent, resumable
+   backfill job using `bucket.head()` (callable from the scheduled handler or an
+   explicit operator entry point) with an explicit policy for missing blobs and
+   unknown sizes; unknown sizes never count as zero; a target whose accounting is
+   incomplete is blocked from further uploads until backfill completes; existing
+   users above quota can download/delete but not add. Document rollout ordering
+   (migrate, deploy, backfill, enforce) in your handoff for the docs step.
+5. Upload rate limit: 10/min keyed on the acting user via the shared limiter.
+6. Section 9 for uploads: expected validation/type/quota failures raise
+   `UserFacingError` with 400/415/413; anything unexpected (for example an R2
+   failure) becomes generic "Upload failed" 500, logged with `console.error`
+   without bodies or tokens.
+7. Update `test/worker/helpers.ts` only to add an upload helper for the new
+   transport, rewrite `test/worker/tracker-attachments.test.ts` for it, and add
+   proof tests: disallowed MIME -> 415, oversize declared length -> 413 before
+   reading, stream longer than declared/cap -> rejected with no blob left,
+   truncated stream -> rejected, 101st file and the byte that passes 500 MB ->
+   413 (use small fake sizes only if you make the limits injectable; otherwise
+   seed rows), coach upload counts against the athlete, concurrent boundary
+   uploads via `Promise.all` cannot both succeed, a simulated R2 failure
+   returns the generic message.
+
+DO NOT:
+- Do not touch `frontend/`, `aspec/`, `README.md` or `.awman/`. The frontend
+  currently sends base64 JSON; it will be updated by the frontend step from
+  your contract, so `test/frontend/api-contract.test.ts` may go stale until
+  then; do not edit it.
+- Do not implement section 2 (import): `src/services/transfer.ts` and
+  `src/routes/transfer.ts` are owned by the next step. Do not change
+  `src/services/dashboard.ts`.
+- Never use `db.transaction()`.
+
+Success criteria:
+- `npm run typecheck`, `npm run lint`, `npm run db:check` and `npm run test:worker`
+  pass; `npm run build` passes (frontend unchanged).
+- `grep -rn "atob\|base64" src/services/attachments.ts src/routes` finds nothing
+  upload-related; `grep -rn "arrayBuffer()\|formData()" src/services/attachments.ts src/routes`
+  finds nothing on the upload path.
+- Every proof scenario above has a passing test.
+
+Before finishing, write `/awman/context/workflow/05-upload-transport.md`: the exact
+HTTP contract (method, path, headers, query, body, every status and error
+message), the allowlist constant name, the quota/reservation design, the
+missing-length decision, the backfill job's entry point, policy and rollout
+ordering, the effective-MIME rule for downloads, and what the frontend must
+change in `frontend/src/api.ts` and `frontend/src/features/plan/`.
+
+Work item (full text; also at aspec/work-items/{{work_item_number}}-security-hardening.md):
+{{work_item_content}}
+'''
+
+[[step]]
+name = "import-hardening"
+agent = "claude"
+depends_on = ["uploads"]
+prompt = '''
+You are working on work item {{work_item_number}} (security hardening) in the Do
+Good Arching repository. Read `/awman/context/workflow/03-request-hardening.md`,
+`/awman/context/workflow/04-lifecycle-api.md` and
+`/awman/context/workflow/05-upload-transport.md` first. This step delivers
+section 2 (import hardening, H2 + H3) and the `dateInput` strengthening it
+requires. It is the LAST step of the backend chain.
+
+Current code: `src/lib/validation.ts` (field schemas: `dateInput`, `httpUrl`,
+session/score/plan inputs), `src/services/transfer.ts` (export/import with a
+global `max(id)` pre-assignment and 0001's parameter-aware chunking, at most 100
+bound parameters per statement), `src/routes/transfer.ts`,
+`test/worker/tracker-transfer.test.ts`.
+
+DO:
+1. `importPayloadSchema` built from the SAME field schemas the write endpoints
+   use: `dateInput` for every `YYYY-MM-DD` field (strengthen it to reject
+   impossible dates such as 2026-02-30 and reuse it in session/score writes and
+   `today` queries), `httpUrl` for link `url` and `videoUrl`, the same `.max()`
+   string lengths, arrows 0-10, `weekNumber` 1-6, poundage and duration ranges,
+   `sightMarksJson` parsing to `Record<string,string>`. Preserve
+   `programState: null` and `currentPoundage: null`; validate cycle/week bounds
+   and cap cycle values so cycle-summary allocation is bounded. Require ten
+   uniquely numbered ends (1-10) per practice score and recompute totals from
+   arrows (or reject inconsistent supplied totals). `.max()` on every array with
+   documented generous limits (for example 20k sessions, 5k scores). Only
+   `kind: "link"` attachments. `{}` stays invalid; legacy `entries` is ignored;
+   a valid version-1 payload with empty arrays and null program state still
+   clears the user's data. Validation errors name the field and index.
+2. Before writing anything, reject duplicate natural keys (`dayKey` overrides,
+   `weekNumber`, milestone/maintenance `key`, `weekStart`), duplicate source IDs
+   within each array, duplicate `(scoreId, endNumber)` pairs, orphan score ends
+   and `item:<id>` checks whose maintenance item is absent; preserve legacy
+   non-ID maintenance check keys.
+3. Atomic replacement in ONE `db.batch`: remove the global `max(id)`
+   pre-assignment; let AUTOINCREMENT assign IDs and resolve score->ends and
+   maintenance item->check relationships INSIDE the same batch (for example a
+   per-import staging/mapping design keyed by a unique import key + source id,
+   resolved with `INSERT ... SELECT` subqueries; dates/labels are not unique
+   parent identifiers). If you need a staging table, add it with a new
+   drizzle-kit migration (next number) and have the batch clean it up.
+   Separate awaited parent/child writes are not acceptable; never
+   `db.transaction()`; never rely on connection-local temporary state.
+   Keep the 100-bound-parameter chunking.
+4. R2 keys of replaced file attachments: record cleanup records for the rows
+   actually replaced in the same batch (the lifecycle step's cleanup-record
+   API), then delete blobs only after the batch succeeds; on failure log,
+   leave the durable record and still return import success. Account for a
+   concurrent coach upload: never delete a key that is still referenced.
+   Validation or D1 failure must leave user data and blobs unchanged.
+5. Limits: an overall request-byte cap checked before JSON parsing
+   (`Content-Length` and/or bounded read), per-array caps, and a preflight
+   check of the generated batch against D1 limits (statement count, statement
+   length, bound values) returning a clear 413/400 before any destructive
+   write. Never split replacement across independently committed batches.
+   Document the effective limits in your handoff.
+6. Tests: rewrite/extend `test/worker/tracker-transfer.test.ts` with proof
+   tests for: `javascript:`/`data:` URLs, impossible dates, over-length strings,
+   oversized arrays/request/batch, duplicate IDs/keys, orphan ends/checks and
+   inconsistent totals each rejected with a field-naming error; export->import
+   round trip keeps supported data, null poundage and legacy `entries`; a valid
+   empty import clears data; a forced late D1 failure leaves all rows and blobs
+   intact; a post-commit R2 failure returns success with a pending cleanup
+   record; import does not touch another user's rows even with concurrent
+   inserts from that user.
+
+DO NOT:
+- Do not touch `frontend/`, `aspec/`, `README.md` or `.awman/`. Another agent is
+  editing `frontend/` right now; ignore transient frontend typecheck/test noise
+  and verify with `npx tsc --noEmit -p tsconfig.worker.json`, `npm run lint`,
+  `npm run db:check` and `npm run test:worker`.
+- Do not change the upload transport, lifecycle endpoints or the coach overview.
+- Do not add exports to `src/routes/tracker.ts`.
+
+Success criteria:
+- `npx tsc --noEmit -p tsconfig.worker.json`, `npm run lint`, `npm run db:check`
+  and `npm run test:worker` pass.
+- `grep -rni "max(id)" src` finds nothing; `grep -rn "transaction(" src` finds nothing.
+- Every proof scenario above has a passing test.
+
+Before finishing, write `/awman/context/workflow/06-import-limits.md`: the
+validation rules and error message format, every documented limit (arrays,
+request bytes, D1 preflight), the staging/mapping design and migration, the
+blob-cleanup behaviour, and the exact behaviours the docs step must describe in
+README "Data export / import" and aspec.
+
+Work item (full text; also at aspec/work-items/{{work_item_number}}-security-hardening.md):
+{{work_item_content}}
+'''
+
+[[step]]
+name = "frontend"
+agent = "codex"
+depends_on = ["uploads"]
+prompt = '''
+You are working on work item {{work_item_number}} (security hardening) in the Do
+Good Arching repository (React 19 + Tailwind v4 + TanStack Query SPA under
+`frontend/`). Read `/awman/context/workflow/03-request-hardening.md`,
+`/awman/context/workflow/04-lifecycle-api.md` and
+`/awman/context/workflow/05-upload-transport.md` first. This step delivers every
+remaining frontend change: the upload transport (section 3), the Settings and
+Team lifecycle UI (section 7) and cache/session behaviour after account changes.
+The invite-fragment change in `App.tsx`/`sw.js` was already made by an earlier
+step; keep it working.
+
+DO:
+- `frontend/src/api.ts`: change the shared `request` helper so uploads do not
+  inherit the unconditional `Content-Type: application/json` (JSON only when a
+  JSON body is sent); implement the upload call exactly per the transport
+  contract in `05-upload-transport.md` with a browser `File`/`Blob` body and
+  without setting `Content-Length`; add typed calls for `POST /api/auth/password`,
+  `POST /api/auth/logout-all`, `DELETE /api/auth/account`,
+  `POST /api/auth/owner/transfer`, the deactivate/reactivate endpoints, the
+  `?include=deactivated` athlete list, and any new `me` fields, per
+  `04-lifecycle-api.md`. Surface server `{ error }` messages (413/415 quota and
+  type errors) in the plan upload UI (`frontend/src/features/plan/`).
+- Settings (`frontend/src/features/settings/SettingsTab.tsx`): change password
+  (current + new + confirm), "Sign out everywhere", "Delete account" with
+  password confirmation; the owner sees a "Transfer ownership" picker (active
+  coaches, excluding themself) instead of delete. After logout-all or deletion,
+  clear the TanStack Query cache and account state and return to the auth screen.
+- Team tab (`frontend/src/features/team/TeamTab.tsx`): Deactivate/Reactivate per
+  athlete and a "Show deactivated" toggle that requests `?include=deactivated`
+  and flags deactivated athletes; invalidate the team queries after each change.
+- Invalidate/refetch the affected queries after role, session or account changes
+  (ownership transfer updates `me`).
+- Keep the SPA working under the CSP from `frontend/public/_headers` (no new
+  inline scripts; check any inline style you add against the `style-src`
+  decision recorded in `03-request-hardening.md`).
+
+DO NOT:
+- Do not edit anything outside `frontend/` except `test/frontend/*` where the
+  upload transport or invite change broke an existing test (`api-contract`,
+  `team-auth`, `links-history`). Do not touch `src/`, `migrations/`, `aspec/`,
+  `README.md` or `.awman/`.
+- Do not write the new frontend test suite (a separate `tests-frontend` step
+  does); only keep existing frontend tests passing.
+- Another agent is editing `src/services/transfer.ts` and worker tests at the
+  same time. Do not run the worker test project as your gate; verify with
+  `npx tsc --noEmit -p frontend/tsconfig.json`, `npx tsc --noEmit -p test/frontend/tsconfig.json`,
+  `npm run lint`, `npm run test:frontend` and `npx vite build --config frontend/vite.config.ts`.
+
+Success criteria:
+- The commands above pass.
+- `grep -rn "base64\|btoa\|readAsDataURL" frontend/src` finds nothing upload-related.
+- Every new endpoint in `04-lifecycle-api.md` has a typed call in `api.ts` and a
+  control in the UI; the owner cannot reach a delete-account control.
+
+Before finishing, write `/awman/context/workflow/07-frontend-changes.md`: where
+each behaviour lives (file and component), the upload call and error handling,
+the cache invalidation rules, the CSP considerations, and a manual click-through
+for the reviewer and for hosted-preview verification.
+
+Work item (full text; also at aspec/work-items/{{work_item_number}}-security-hardening.md):
+{{work_item_content}}
+'''
+
+[[step]]
+name = "tests-security-auth"
+agent = "codex"
+depends_on = ["import-hardening"]
+prompt = '''
+You are writing tests for work item {{work_item_number}} (security hardening) in
+the Do Good Arching repository. Read `/awman/context/workflow/01-auth-rate-limits.md`,
+`/awman/context/workflow/03-request-hardening.md` and
+`/awman/context/workflow/04-lifecycle-api.md` first. You did not implement the
+code; treat it adversarially and try to make it fail. This step owns the
+`worker` vitest project tests for sections 1 (PBKDF2), 4 (CSRF), 5 (headers and
+invite fragment), 6 (rate limiting) and 7 (lifecycle), plus migration coverage.
+A sibling step, `tests-data-paths`, owns import/upload/coach-overview/error
+tests at the same time, and another agent is editing `frontend/`, `README.md` and
+`aspec/`. Only create or edit files matching `test/worker/auth*`, `test/worker/csrf*`,
+`test/worker/headers*`, `test/worker/rate-limit*`, `test/worker/lifecycle*`,
+`test/worker/account*`, `test/worker/team*`, `test/worker/invite*`,
+`test/worker/migration*`, `test/worker/cleanup*` (plus new helper files under
+`test/worker/` with distinct names), and only run your own files
+(`npx vitest run --project worker test/worker/<file>`), never the whole suite.
+
+Cover, with real local D1/R2 through `SELF.fetch`, at least:
+- PBKDF2: bootstrap, invite acceptance and login with the stored format at the
+  new count; a supported lower count upgrades on login exactly once; malformed
+  and 210k hashes fail safely with the generic message and no 500; a rehash
+  cannot overwrite a concurrent password change (race the login against
+  `POST /api/auth/password`); the operator reset procedure from
+  `01-auth-rate-limits.md` performed as SQL in the test preserves account data
+  and owner status and revokes sessions.
+- CSRF: cross-site, sibling-site and `null` Origin -> 403 on a JSON endpoint,
+  the upload endpoint and a bodyless endpoint (logout/delete); missing Origin +
+  `Sec-Fetch-Site: same-origin` passes; absent proof fails; conflicting Origin
+  with same-origin Fetch Metadata fails; `text/plain`/missing content type ->
+  415; malformed JSON -> 400; JSON with charset succeeds; error bodies are JSON.
+- Headers: CSP and the other headers on `/api/*` success, 404, 500 and a file
+  download; `_headers` exists in the build output (a `build` project test under
+  `scripts/` is acceptable if it fits the existing pattern); `invitePath` uses
+  the fragment and legacy `/invite/<token>` is still accepted by the API
+  behaviour that matters (accept-invite by token).
+- Rate limiting (mock the binding as documented): 429 when denied; missing or
+  erroring binding fails closed; login checks both per-IP and normalized
+  per-username keys (`LoGin` and `login` share a key); 5/min vs 10/min binding
+  selection per operation; upload actor keys; the `rate_limits` table is gone
+  after migrations; production and preview namespaces differ in `wrangler.toml`.
+- Lifecycle: password change revokes other sessions and keeps the current one;
+  logout-all; account deletion removes every user-scoped row and blob, and a
+  forced R2 failure leaves a durable retry after the user is gone; owner
+  deletion refused before transfer and allowed after; last-coach deletion
+  refused; deleting a non-owner coach preserves athlete data/files, nulls
+  inviter references and keeps their athlete invites usable while creatorless
+  coach invites fail; after a transfer exactly one owner exists and `/me`
+  reflects it; invalid targets (athlete, deactivated, self, missing); concurrent
+  transfer/transfer and transfer/target-deletion via `Promise.all` leave exactly
+  one owner; deactivated athlete cannot log in or use an existing session, is
+  hidden by default, appears flagged with `?include=deactivated`, can be
+  reactivated and keeps data; repeated deactivate/reactivate is idempotent;
+  coach target -> 404; login racing deactivation cannot leave a live session;
+  old-owner coach invites cannot be accepted after transfer; 0001's concurrent
+  invite claim protection still holds with the new user column; scheduled
+  cleanup respects the expiry/30-day boundaries, is repeatable, retries R2
+  failures and keeps referenced objects.
+- Migrations: applying the new migrations on top of a database populated with
+  0002-era data (users, invites, attachments, a `rate_limits` row) succeeds and
+  yields the expected columns/tables; the size backfill is repeatable.
+
+Rules:
+- Do not modify product code, `vitest.config.ts`, `test/worker/helpers.ts` or
+  `test/worker/setup.ts`. If you find a bug, keep the failing test and record it
+  in `/awman/context/workflow/test-findings.md` (file, expected, actual,
+  assessment); never skip or weaken a test to make it green.
+- Tests must be deterministic and independent; do not depend on wall-clock
+  timing beyond what the mock and seeded timestamps allow.
+
+Success criteria:
+- Every scenario above has a test; your files pass except for tests documenting
+  a real bug listed in `test-findings.md`.
+- `npm run lint` and `npx tsc --noEmit -p test/worker/tsconfig.json` pass on your files.
+
+Before finishing, write `/awman/context/workflow/tests-security-auth-coverage.md`:
+the test files, the scenarios each covers, and anything not covered and why.
+
+Work item (full text; also at aspec/work-items/{{work_item_number}}-security-hardening.md):
+{{work_item_content}}
+'''
+
+[[step]]
+name = "tests-data-paths"
+agent = "claude"
+depends_on = ["import-hardening"]
+prompt = '''
+You are writing tests for work item {{work_item_number}} (security hardening) in
+the Do Good Arching repository. Read `/awman/context/workflow/02-coach-overview.md`,
+`/awman/context/workflow/03-request-hardening.md`,
+`/awman/context/workflow/04-lifecycle-api.md`,
+`/awman/context/workflow/05-upload-transport.md` and
+`/awman/context/workflow/06-import-limits.md` first. You did not implement the
+code; treat it adversarially and try to make it fail. This step owns the
+`worker` vitest project tests for sections 2 (import), 3 (uploads and quotas),
+8 (coach overview) and 9 (error leakage). A sibling step, `tests-security-auth`,
+owns auth/CSRF/headers/rate-limit/lifecycle/migration tests at the same time,
+and another agent is editing `frontend/`, `README.md` and `aspec/`. Only create
+or edit files matching `test/worker/tracker-transfer*`, `test/worker/import*`,
+`test/worker/tracker-attachments*`, `test/worker/upload*`, `test/worker/quota*`,
+`test/worker/coach-overview*`, `test/worker/errors*` (plus new helper files under
+`test/worker/` with distinct names), and only run your own files
+(`npx vitest run --project worker test/worker/<file>`), never the whole suite.
+
+Cover, with real local D1/R2, at least:
+- Import: rejects `javascript:` and `data:` URLs, impossible dates, over-length
+  strings, oversized arrays, an oversized request body (413 before parsing), a
+  batch that exceeds the documented D1 preflight limits, duplicate IDs/keys,
+  orphan ends/checks and inconsistent score totals, each with an error naming
+  the field and index; export->import round trip keeps supported data, null
+  poundage and ignores legacy `entries`; a valid empty import clears data and
+  `{}` is 400; a forced failure late in the D1 batch (for example a seeded
+  constraint violation on the last chunk) restores all user rows and leaves
+  referenced R2 blobs intact; a post-commit R2 failure returns success and
+  creates a retryable cleanup record; a concurrent coach upload during import
+  is never deleted; import never touches another user's rows or IDs even with
+  concurrent inserts from that user (`Promise.all`); parameter chunking stays
+  under 100 bound values per statement for a large payload.
+- Uploads: disallowed MIME -> 415 and MIME normalisation (`IMAGE/PNG; x=y`);
+  declared oversize `Content-Length` rejected before reading; a stream longer
+  than declared or than the cap; a truncated stream; a missing `Content-Length`
+  per the documented policy; an R2 put followed by a failed D1 insert leaves no
+  blob or a cleanup record; coach upload counts against the athlete; the 101st
+  file and the upload that would pass 500 MB are rejected with 413 naming the
+  limit; two concurrent uploads competing for the final file/byte allowance
+  cannot both succeed; abandoned reservations are released by the cleanup job;
+  unknown backfilled sizes block uploads rather than counting as zero; accounts
+  above quota can still download/delete; the upload rate limit keys on the
+  acting user; downloads of a non-allowlisted stored type are served as
+  `application/octet-stream` with a matching filename extension.
+- Coach overview: seed distinctive strings in notes, focus, score, weekly notes,
+  setups and inspiration and assert none appear in the response; capture the
+  executed SQL (reuse the technique in `02-coach-overview.md`) and assert no
+  private table or column is read; aggregates match the athlete dashboard.
+- Errors: a simulated R2 failure returns the generic "Upload failed" message and
+  never the underlying error text; expected failures use 400/415/413 in the
+  `{ error }` envelope; nothing logs a request body or token (spy on console).
+
+Rules:
+- Do not modify product code, `vitest.config.ts`, `test/worker/helpers.ts` or
+  `test/worker/setup.ts`. If you find a bug, keep the failing test and record it
+  in `/awman/context/workflow/test-findings.md` (file, expected, actual,
+  assessment); never skip or weaken a test to make it green.
+- Tests must be deterministic and independent; keep large seeds batched and
+  within the 30 s timeout.
+
+Success criteria:
+- Every scenario above has a test; your files pass except for tests documenting
+  a real bug listed in `test-findings.md`.
+- `npm run lint` and `npx tsc --noEmit -p test/worker/tsconfig.json` pass on your files.
+
+Before finishing, write `/awman/context/workflow/tests-data-paths-coverage.md`:
+the test files, the scenarios each covers, and anything not covered and why.
+
+Work item (full text; also at aspec/work-items/{{work_item_number}}-security-hardening.md):
+{{work_item_content}}
+'''
+
+[[step]]
+name = "tests-frontend"
+agent = "claude"
+depends_on = ["frontend"]
+prompt = '''
+You are writing frontend tests for work item {{work_item_number}} (security
+hardening) in the Do Good Arching repository (`frontend` vitest project, jsdom,
+Testing Library; existing suites under `test/frontend/`). Read
+`/awman/context/workflow/03-request-hardening.md`,
+`/awman/context/workflow/04-lifecycle-api.md`,
+`/awman/context/workflow/05-upload-transport.md` and
+`/awman/context/workflow/07-frontend-changes.md` first. You did not implement the
+code; treat it adversarially. Other agents are concurrently editing
+`src/services/transfer.ts`, worker tests, `README.md` and `aspec/`: only create or
+edit files under `test/frontend/` and `frontend/src/**/*.test.tsx`, and run only
+`npm run test:frontend`, `npm run lint` and
+`npx tsc --noEmit -p test/frontend/tsconfig.json`.
+
+Cover at least:
+- Invite links: `/invite#<token>` and legacy `/invite/<token>` both capture the
+  token and call `replaceState` to remove it; a fragment-less `/invite` shows the
+  right state.
+- Upload transport: the API call sends the file as the body with the contract
+  from `05-upload-transport.md`, does not send `Content-Type: application/json`,
+  does not set `Content-Length`, and 413/415 server messages are shown to the user.
+- Settings: change password (validation, success, wrong current password error),
+  "Sign out everywhere" and "Delete account" clear the query cache and return to
+  the auth screen; the owner sees the transfer-ownership picker (active coaches
+  only, not themself) and no delete control; a successful transfer updates `me`.
+- Team tab: Deactivate/Reactivate controls, the "Show deactivated" toggle
+  requests `?include=deactivated` and flags deactivated athletes, and the team
+  query is invalidated after each change.
+- Query-cache invalidation after role/session/account changes.
+- JSON requests still send only the JSON content type (regression for the
+  `request` helper change).
+
+Rules:
+- Do not modify product code or `vitest.config.ts`. If you find a bug, keep the
+  failing test and record it in `/awman/context/workflow/test-findings.md`
+  (file, expected, actual, assessment); never skip or weaken a test.
+- jsdom does not enforce CSP; note in your coverage file that CSP must be
+  exercised in a real browser on the hosted preview.
+
+Success criteria:
+- Every scenario above has a test; `npm run test:frontend` passes except for
+  tests documenting a real bug listed in `test-findings.md`.
+- `npm run lint` and the frontend test typecheck pass on your files.
+
+Before finishing, write `/awman/context/workflow/tests-frontend-coverage.md`: the
+test files, the scenarios each covers, and anything not covered and why.
+
+Work item (full text; also at aspec/work-items/{{work_item_number}}-security-hardening.md):
+{{work_item_content}}
+'''
+
+[[step]]
+name = "docs"
+agent = "codex"
+depends_on = ["import-hardening", "frontend"]
+prompt = '''
+You are working on work item {{work_item_number}} (security hardening) in the Do
+Good Arching repository. This step updates `README.md` and the `aspec/` design
+reference so they describe the project as it now is. Read every handoff in
+`/awman/context/workflow/` (`01-auth-rate-limits.md` through
+`07-frontend-changes.md`), then `README.md`, `REVIEW.md`, `wrangler.toml`,
+`src/db/schema.ts`, the migrations and the code. The code is the source of
+truth; take facts only from it, the handoffs, the work item's Decisions list and
+existing docs. Other agents are concurrently writing tests under `test/` and
+`test/frontend/`; do not edit anything outside `README.md` and `aspec/`.
+
+DO:
+- `grep -rn "Planned (work item 0002)" aspec README.md` currently lists about
+  twenty notes. Turn each one whose implementation has now landed into current
+  behaviour; leave a note only for something genuinely not implemented and say
+  why. Update the matching aspec files: `foundation.md` (roles: deactivation,
+  ownership transfer, account deletion rules), `architecture/design.md` (schema:
+  `deactivated_at`, `size_bytes`, cleanup/reservation/staging tables, dropped
+  `rate_limits`; scheduled handler), `architecture/security.md` (hash format and
+  supported counts, CSRF rules, headers/CSP and the `style-src` decision, rate
+  limits including the per-location approximation and fail-closed behaviour,
+  invite fragment, quotas, error-leakage policy, coach-overview query rule),
+  `architecture/apis.md` (every new/changed endpoint, status codes incl. 413/415/
+  503, upload transport, `?include=deactivated`, import limits), `uxui/experience.md`
+  and `uxui/setup.md` (Settings/Team flows, PWA notes), `devops/infrastructure.md`
+  (Rate Limiting bindings with distinct namespaces, Cron Triggers, `_headers`),
+  `devops/operations.md` (the manual password reset runbook updated for the
+  supported hash format and session revocation, the size backfill and its
+  rollout ordering, the cleanup job), `devops/localdev.md` (local binding mocks,
+  Vite proxy and CSRF). Keep each file's heading structure; keep each fact in
+  one place and link from the others. Preserve the owner-managed exclusions:
+  never touch `aspec/devops/subagents.md`, `.awman/` or any work item file.
+- `README.md`: API overview (new endpoints), roles table (deactivation,
+  ownership transfer), import limits, upload quotas and allowed types, the
+  admin password reset procedure (link to the runbook), environments (rate
+  limit namespaces, cron), and "Verification status": describe the automated
+  coverage honestly from the test files that exist right now and state
+  plainly that hosted-preview verification (signup, login, upload/download,
+  rate limiting, deactivation, PWA install, CSP in a real browser, `_headers`
+  on `/`, `/invite` and SPA fallback) is REQUIRED and NOT yet performed by this
+  run; do not claim it was.
+- If you hit a product decision that is not covered, describe the current
+  behaviour and append the question to `/awman/context/workflow/open-questions.md`;
+  no open-question lists inside `aspec/`.
+
+Success criteria:
+- `npm run docs:check` passes and `grep -rn "Planned (work item 0002)" aspec README.md`
+  returns only notes you deliberately kept, each with a reason in the text
+  (`aspec/work-items/` excluded).
+- Every endpoint in `04-lifecycle-api.md` and `05-upload-transport.md` appears in
+  `aspec/architecture/apis.md` and the README API overview with matching status codes.
+- The reset runbook in `aspec/devops/operations.md` matches the constants and SQL
+  in `01-auth-rate-limits.md`.
+
+Before finishing, write `/awman/context/workflow/docs-notes.md`: which files you
+changed, which facts you were unsure about and how you resolved them, and the
+spot-checks a reviewer should perform.
+
+Work item (full text; also at aspec/work-items/{{work_item_number}}-security-hardening.md):
+{{work_item_content}}
+'''
+
+[[step]]
+name = "review-backend"
+agent = "codex"
+depends_on = ["tests-security-auth", "tests-data-paths"]
+prompt = '''
+You are the independent, adversarial reviewer for the backend of work item
+{{work_item_number}} (security hardening) in the Do Good Arching repository.
+Other agents implemented and tested it; your job is to find what they got wrong.
+You do NOT fix anything: you produce findings a separate remediation step acts on.
+
+Read first: every `0*-*.md` handoff in `/awman/context/workflow/`,
+`tests-security-auth-coverage.md`, `tests-data-paths-coverage.md` and, if
+present, `test-findings.md`. Then review the diff against `main` (or the whole
+working tree if there is no base) for `src/`, `migrations/`, `wrangler.toml`,
+`vitest.config.ts`, `package.json`, `scripts/` and `test/worker/`. Another agent
+may still be editing `frontend/`, `README.md` and `aspec/`; ignore those here.
+
+Check, at minimum, every bullet of the work item's Implementation Details
+sections 1 to 9 that concerns the backend, and every backend bullet of its Edge
+Case Considerations and Test Considerations. Specifically verify by reading the
+code, not the notes:
+- PBKDF2: 100,000 constant, floor and max enforced, 16-byte salt / 32-byte hash
+  checks, no throw and no zero-length comparison on malformed input, conditional
+  rehash, comparable work for unknown/deactivated users, no local 210k exception.
+- Rate limiting: bindings declared for production and preview with distinct
+  namespaces; `rateLimit` is the only route-facing interface; fail-closed
+  outside explicit mocks; the key set and limits match section 6; IP checks
+  before body parsing, username checks after validation and before hashing; no
+  `X-Forwarded-For`; `rate_limits` dropped in a migration; upload and
+  password-verification limits present.
+- CSRF: explicit guard on every unsafe `/api/*` method incl. bodyless routes and
+  raw uploads; Origin/`Sec-Fetch-Site` rules exactly as specified; 415 before
+  parsing in `validateJson`; `SameSite=Strict`; the PWA no-Origin decision is
+  evidenced, not assumed.
+- Headers: `_headers` content, API middleware coverage of errors and downloads,
+  no relaxed `script-src`; invite fragment with legacy path support.
+- Lifecycle: every batch guard (conditional rehash, session retention, owner and
+  last-coach checks inside the batch, transfer that can never commit zero
+  owners), deactivation/login race guard, `authMiddleware` 401, athlete list
+  filter, cleanup records not FK-bound to users, cron config and bounded
+  batches, no `db.transaction()`.
+- Uploads: no whole-body buffering, declared and actual length enforcement,
+  missing-length policy, allowlist constant, MIME normalisation, effective MIME
+  for downloads, atomic reservation-based quota, cleanup of orphan blobs,
+  `size_bytes` migration and backfill policy, actor-state recheck, upload rate
+  limit, `UserFacingError` mapping and generic 500.
+- Import: schema built from the shared field schemas, strengthened `dateInput`
+  reused by writes and `today`, duplicate/orphan/total checks before writes,
+  single-batch replacement with in-batch ID resolution and no `max(id)`,
+  cleanup records for replaced blobs, post-commit deletion, request/array/D1
+  preflight caps with clear 413/400, chunking under 100 parameters.
+- Coach overview: query projections exclude private columns and tables; the
+  test captures SQL rather than only the body.
+- Migrations: no edits to 0001/0002; snapshots/journal consistent; `db:check`
+  green; FK and owner index invariants preserved.
+- Tests: every backend Test Considerations bullet has a real test that would fail
+  on regression (hunt for tautological, skipped or mocked-away tests).
+
+Run `npm run typecheck`, `npm run lint`, `npm run db:check` and
+`npm run test:worker` yourself and include the results (frontend/docs noise from
+the concurrent agents is out of scope).
+
+Write `/awman/context/workflow/review-backend-findings.md`. For each finding give
+a severity (blocker / major / minor / nit), file and line, what is wrong, how to
+reproduce or which test would expose it, and the concrete fix expected. Also
+list what you verified as correct so remediation does not re-check it. End with
+`VERDICT: ready` or `VERDICT: needs-remediation`. Do not modify any file outside
+`/awman/context/workflow/`.
+
+Work item (full text; also at aspec/work-items/{{work_item_number}}-security-hardening.md):
+{{work_item_content}}
+'''
+
+[[step]]
+name = "review-frontend-docs"
+agent = "claude"
+depends_on = ["tests-frontend", "docs"]
+prompt = '''
+You are the independent, adversarial reviewer for the frontend and documentation
+of work item {{work_item_number}} (security hardening) in the Do Good Arching
+repository. Other agents implemented and tested it; find what they got wrong.
+You do NOT fix anything: you produce findings a separate remediation step acts on.
+
+Read first: `/awman/context/workflow/03-request-hardening.md`,
+`04-lifecycle-api.md`, `05-upload-transport.md`, `07-frontend-changes.md`,
+`tests-frontend-coverage.md`, `docs-notes.md` and, if present,
+`open-questions.md` and `test-findings.md`. Then review the diff for `frontend/`,
+`README.md`, `test/frontend/` and `aspec/` (excluding `aspec/work-items/` and
+`aspec/devops/subagents.md`). Other reviewers may still be running worker tests;
+do not run the worker project.
+
+Frontend: verify the upload transport matches the backend contract exactly
+(method, path, headers, body, no JSON content type, no `Content-Length`), 413/415
+messages reach the user, the Settings lifecycle controls and owner transfer
+picker, the Team deactivation controls and toggle, cache clearing after
+logout-all/deletion and invalidation after transfer, the invite fragment plus
+legacy path with `replaceState`, and that nothing added violates the CSP in
+`frontend/public/_headers` (inline scripts, external hosts, the `style-src`
+decision). Build the SPA (`npx vite build --config frontend/vite.config.ts`) and
+inspect `dist/client/_headers` and `dist/client/sw.js`. Confirm
+`frontend/src/api.ts` matches every backend route and response shape, and that
+the frontend tests are real (not tautological).
+
+Docs: run `npm run docs:check`; grep `Planned (work item 0002)` and confirm each
+remaining note is justified; spot-check against the code at least: the reset
+runbook in `aspec/devops/operations.md` vs the constants in `src/lib/auth.ts`;
+the rate-limit and cron sections in `aspec/devops/infrastructure.md` vs
+`wrangler.toml`; every endpoint in `aspec/architecture/apis.md` and the README
+API overview vs `src/routes/*`; quotas, allowed types and import limits vs the
+constants in `src/lib/validation.ts` and the services; the roles table; the
+README "Verification status" must state that hosted-preview verification has
+not been performed by this run. Confirm `subagents.md`, `.awman/` and the work
+item files are untouched.
+
+Run `npm run typecheck`, `npm run lint`, `npm run test:frontend`,
+`npm run docs:check` and `npm run build` yourself and include the results.
+
+Write `/awman/context/workflow/review-frontend-docs-findings.md`. For each finding
+give a severity (blocker / major / minor / nit), file and line, what is wrong,
+how to reproduce, and the concrete fix expected. Also list what you verified as
+correct. End with `VERDICT: ready` or `VERDICT: needs-remediation`. Do not modify
+any file outside `/awman/context/workflow/`.
+
+Work item (full text; also at aspec/work-items/{{work_item_number}}-security-hardening.md):
+{{work_item_content}}
+'''
+
+[[step]]
+name = "remediate"
+agent = "claude"
+depends_on = ["review-backend", "review-frontend-docs"]
+prompt = '''
+You are remediating the review findings for work item {{work_item_number}}
+(security hardening) in the Do Good Arching repository. Read
+`/awman/context/workflow/review-backend-findings.md`,
+`/awman/context/workflow/review-frontend-docs-findings.md` and, if present,
+`/awman/context/workflow/test-findings.md` and
+`/awman/context/workflow/open-questions.md`. The `0*-*.md` handoffs describe the
+design decisions each step made.
+
+DO:
+- Fix every blocker and major finding, and every real bug recorded in
+  `test-findings.md` (keep the failing tests; make them pass by fixing the code,
+  not the test). Fix minor findings and nits when the fix is local and safe;
+  otherwise list them as deferred with a reason.
+- If a finding contradicts the work item, the work item wins; say so.
+- When a fix changes behaviour that `aspec/` or `README.md` documents, update the
+  matching document in the same change.
+- Keep the item's constraints: no `db.transaction()`, atomic batches with
+  in-batch guards, fail-closed rate limiting, no whole-body buffering on
+  uploads, `{ error: string }` envelopes, never edit applied migrations
+  (add a new one if the schema must change and keep `db:check` green),
+  `.awman/`, `aspec/devops/subagents.md` and the work item files untouched.
+
+Success criteria: `npm run typecheck`, `npm run lint`, `npm run docs:check`,
+`npm run db:check`, `npm test` and `npm run build` all pass.
+
+Before finishing, write `/awman/context/workflow/remediation-notes.md`: each
+finding with its outcome (fixed / deferred with reason / rejected with reason and
+the work-item text that justifies it) and the commands you ran with their results.
+
+Work item (full text; also at aspec/work-items/{{work_item_number}}-security-hardening.md):
+{{work_item_content}}
+'''
+
+[[step]]
+name = "verify-remediation"
+agent = "codex"
+depends_on = ["remediate"]
+abort_on_failure = true
+prompt = '''
+You are the final gate for work item {{work_item_number}} (security hardening)
+in the Do Good Arching repository. Read
+`/awman/context/workflow/review-backend-findings.md`,
+`/awman/context/workflow/review-frontend-docs-findings.md`,
+`/awman/context/workflow/remediation-notes.md` and, if present,
+`/awman/context/workflow/test-findings.md`.
+
+Verify that every blocker and major finding was actually fixed in the code (read
+the code, do not trust the notes), that deferred or rejected findings have a
+sound reason grounded in the work item, and that no fix introduced a regression.
+Run `npm run typecheck`, `npm run lint`, `npm run docs:check`, `npm run db:check`,
+`npm test` and `npm run build`, plus `grep -rn "transaction(" src`,
+`grep -rn "210000" src`, `grep -rn "SameSite=Lax" src` and
+`grep -rni "max(id)" src` (all must be empty). Confirm `.awman/`,
+`aspec/devops/subagents.md`, `migrations/0001_init.sql` and
+`migrations/0002_team_auth.sql` are unchanged.
+
+Write `/awman/context/workflow/final-verdict.md` with the results, a list of
+items that still need a human (hosted-preview verification per the work item's
+manual checks, any open questions), and a `VERDICT: ready` or
+`VERDICT: not-ready` line. If everything passes and no blocker or major finding
+remains open, finish successfully. If a blocker or major finding remains open or
+any command fails, you may fix it yourself when the fix is small and unambiguous
+(record what you changed); otherwise exit with a non-zero status so the
+workflow stops for a human.
+
+Work item (full text; also at aspec/work-items/{{work_item_number}}-security-hardening.md):
+{{work_item_content}}
+'''
+
+# ── Teardown ──────────────────────────────────────────────────────────────────
+
+[[teardown]]
+type = "run_shell"
+command = "npm run typecheck && npm run lint && npm run docs:check && npm run db:check && npm test && npm run build"
+abort_on_failure = true
+
+[teardown.on_failure]
+prompt = "The final verification for work item 0002 (security hardening) failed: typecheck, lint, aspec placeholder check, drizzle-kit no-diff check, the vitest suite, or the build. Read the failing output, fix the root cause in the code or docs without weakening, skipping or deleting tests and without editing applied migrations, and make `npm run typecheck && npm run lint && npm run docs:check && npm run db:check && npm test && npm run build` pass. Do not touch .awman/, aspec/devops/subagents.md or the work item files."
+agent = "claude"
+max_attempts = 2
+
+[[teardown]]
+type = "commit_changes"
+message = "Security hardening from the 2026-09-26 review (work item {{work_item_number}})"
+add_all = true
+
+[[teardown]]
+type = "push_branch"
+overlays = ["ssh()"]
+
+[[teardown]]
+type = "create_pull_request"
+title = "Work item {{work_item_number}}: security hardening"
+body = "Implements work item {{work_item_number}}: PBKDF2 at 100k with safe verification and rehash (C2), import validation and single-batch atomic replacement (H2, H3), streaming uploads with MIME allowlist and atomic per-athlete quotas (H4), explicit CSRF guard, 415 on non-JSON bodies and SameSite=Strict (H5), security headers and invite-token fragment (M1), Workers Rate Limiting bindings (M2), password change / logout-all / account deletion / athlete deactivation / ownership transfer / scheduled cleanup (M3), query-only coach overview (M4), and user-facing error mapping (M6). H1 remains out of scope. Hosted-preview verification (signup, login, upload/download, rate limiting, deactivation, PWA install, CSP and _headers in a real browser) is still required before merge; see README Verification status and /awman/context/workflow/final-verdict.md. See aspec/work-items/{{work_item_number}}-security-hardening.md."
+overlays = ["env(GITHUB_TOKEN)"]

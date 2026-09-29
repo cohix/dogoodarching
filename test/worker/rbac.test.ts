@@ -1,7 +1,7 @@
 // RBAC matrix across every /api/coach/* route, plus the attachment download rule.
 import { describe, expect, it } from "vitest";
 import { addOwnLink, countRows, filePayload, setupTeam, uploadFileForAthlete, uploadOwnFile, type Team } from "./auth-fixtures";
-import { api, apiJson, type RequestOptions, type Session } from "./helpers";
+import { api, apiJson, uploadFile, type RequestOptions, type Session } from "./helpers";
 
 /** Every coach route. `body` is a valid payload; `setup` creates any row the route needs. */
 interface CoachRoute {
@@ -46,6 +46,7 @@ const ROUTES: CoachRoute[] = [
 ];
 
 function request(route: CoachRoute, path: string, session?: Session): Promise<Response> {
+  if (path.endsWith("/files")) return uploadFile(path, session, route.body);
   const options: RequestOptions = { method: route.method, cookie: session?.cookie };
   if (route.body) options.json = route.body;
   return api(path, options);

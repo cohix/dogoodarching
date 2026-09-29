@@ -1,4 +1,4 @@
-import { type PlannedSession, api, fileToBase64 } from "../../api";
+import { type PlannedSession, api, ApiError } from "../../api";
 import { useState, type FormEvent } from "react";
 import { useEscapeToClose } from "../../components/useEscapeToClose";
 import { useMutation } from "@tanstack/react-query";
@@ -27,13 +27,14 @@ export function PlannedSessionModal({ session, onClose, onSaved, athleteId }: { 
   });
   const addFile = useMutation({
     mutationFn: async (file: File) => {
-      if (file.size > 8_000_000) throw new Error("too-large");
-      const encoded = await fileToBase64(file);
-      const args = { dayKey: session.dayKey, kind: (file.type.startsWith("image/") ? "photo" : "document") as "document" | "photo", label: file.name, mimeType: encoded.mimeType || "application/octet-stream", dataBase64: encoded.dataBase64 };
+      if (file.size > 8_000_000) throw new ApiError(413, "Choose a file no larger than 8 MB.");
+      if (file.size === 0) throw new ApiError(400, "Choose a file that is not empty.");
+      const args = { dayKey: session.dayKey, kind: (file.type.toLowerCase().startsWith("image/") ? "photo" : "document") as "document" | "photo", label: file.name, file };
       return athleteId ? api.coachAddPlannedSessionFile(athleteId, args) : api.addPlannedSessionFile(args);
     },
     onSuccess: () => { onSaved(); setMessage("Attachment added"); },
-    onError: (error) => setMessage(error instanceof Error && error.message === "too-large" ? "Choose a file smaller than 8 MB." : "Couldn’t add that file. Try again."),
+    onMutate: () => setMessage(""),
+    onError: (error) => setMessage(error instanceof ApiError ? error.message : "Couldn’t add that file. Try again."),
   });
   const removeAttachment = useMutation({
     mutationFn: (id: number) => athleteId ? api.coachDeletePlannedSessionAttachment(athleteId, id) : api.deletePlannedSessionAttachment({ id }),
@@ -52,7 +53,7 @@ export function PlannedSessionModal({ session, onClose, onSaved, athleteId }: { 
       </form> : <div className="mt-5">
         <div className="flex items-start justify-between gap-4"><div><p className="text-lg font-bold">{session.detail}</p><p className="mt-3 whitespace-pre-line text-sm leading-6 text-[var(--dim)]">{session.prescription}</p>{session.updatedAt === null && <p className="mt-3 rounded-lg bg-[var(--accent-soft)] px-3 py-2 text-xs leading-5">This day still shows the generic starter plan. {athleteId ? "Edit it to set this athlete’s session; they can change it too." : "Edit it to make it your own; your coach can edit it too."}</p>}</div><button type="button" onClick={() => { setEditing(true); setMessage(""); }} aria-label={`Edit ${session.day} planned session`} className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-[var(--surface-2)]"><svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg></button></div>
       </div>}
-      <section className="mt-6 border-t border-[var(--border)] pt-5" aria-labelledby="planned-session-attachments"><div className="flex items-baseline justify-between gap-3"><div><h3 id="planned-session-attachments" className="section-title">Attachments</h3><p className="mt-1 text-xs text-[var(--dim)]">Documents, photos, and reference links</p></div><label className="cursor-pointer rounded-lg bg-[var(--accent-soft)] px-3 py-2 text-xs font-bold text-[var(--accent)]"><span>{addFile.isPending ? "Uploading…" : "+ File or photo"}</span><input className="sr-only" type="file" accept="image/*,.pdf,.doc,.docx,.txt,.rtf" disabled={addFile.isPending} aria-label="Add a document or photo" onChange={(event) => { const file = event.target.files?.[0]; if (file) addFile.mutate(file); event.currentTarget.value = ""; }} /></label></div>
+      <section className="mt-6 border-t border-[var(--border)] pt-5" aria-labelledby="planned-session-attachments"><div className="flex items-baseline justify-between gap-3"><div><h3 id="planned-session-attachments" className="section-title">Attachments</h3><p className="mt-1 text-xs text-[var(--dim)]">JPEG, PNG, WebP, HEIC, PDF or Office files (up to 8 MB), and reference links</p></div><label className="cursor-pointer rounded-lg bg-[var(--accent-soft)] px-3 py-2 text-xs font-bold text-[var(--accent)]"><span>{addFile.isPending ? "Uploading…" : "+ File or photo"}</span><input className="sr-only" type="file" accept="image/jpeg,image/png,image/webp,image/heic,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation,.jpg,.jpeg,.png,.webp,.heic,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx" disabled={addFile.isPending} aria-label="Add a document or photo" onChange={(event) => { const file = event.target.files?.[0]; if (file) addFile.mutate(file); event.currentTarget.value = ""; }} /></label></div>
         <div className="mt-4 space-y-2">
           {session.attachments.map((attachment) => <div key={attachment.id} className="flex items-center gap-3 rounded-xl bg-[var(--surface-2)] p-3"><span aria-hidden="true" className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-[var(--surface)] text-[10px] font-black uppercase text-[var(--accent)]">{attachment.kind === "photo" ? "IMG" : attachment.kind === "link" ? "URL" : "DOC"}</span><div className="min-w-0 flex-1"><p className="truncate text-sm font-bold">{attachment.label}</p><p className="text-xs capitalize text-[var(--dim)]">{attachment.kind}</p></div><SafeLink url={attachment.url} className="shrink-0 rounded-lg px-2 py-2 text-xs font-bold text-[var(--accent)]">Open</SafeLink><button type="button" disabled={removeAttachment.isPending} onClick={() => removeAttachment.mutate(attachment.id)} aria-label={`Remove ${attachment.label}`} className="shrink-0 rounded-lg px-2 py-2 text-xs font-bold text-[var(--dim)]">Remove</button></div>)}
           {session.attachments.length === 0 && <p className="rounded-xl border border-dashed border-[var(--border)] px-4 py-6 text-center text-sm text-[var(--dim)]">No attachments yet.</p>}

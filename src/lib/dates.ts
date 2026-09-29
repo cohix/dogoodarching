@@ -7,6 +7,12 @@ export const WEEK_MS = 7 * 86400000;
 
 /** Six-week training cycles: cycle/week arithmetic is done on absolute week numbers. */
 const WEEKS_PER_CYCLE = 6;
+/** About 23 years of six-week cycles; bounds dashboard allocation even after elapsed time. */
+export const MAX_PROGRAM_CYCLES = 200;
+
+function boundedWeek(value: number): number {
+  return Math.min(MAX_PROGRAM_CYCLES * WEEKS_PER_CYCLE - 1, Math.max(0, value));
+}
 
 export function isoWeekKey(value: string): string {
   const date = new Date(`${value}T12:00:00Z`);
@@ -31,7 +37,7 @@ export function datedProgramState(
   const anchorMonday = mondayDate(state.updatedAt.toISOString().slice(0, 10));
   const todayMonday = mondayDate(today);
   const elapsedWeeks = Math.max(0, Math.floor((todayMonday.getTime() - anchorMonday.getTime()) / WEEK_MS));
-  const absoluteWeek = Math.max(0, ((state.currentCycle - 1) * WEEKS_PER_CYCLE) + (state.currentWeek - 1) + elapsedWeeks);
+  const absoluteWeek = boundedWeek(((state.currentCycle - 1) * WEEKS_PER_CYCLE) + (state.currentWeek - 1) + elapsedWeeks);
   return { currentCycle: Math.floor(absoluteWeek / WEEKS_PER_CYCLE) + 1, currentWeek: (absoluteWeek % WEEKS_PER_CYCLE) + 1 };
 }
 
@@ -39,7 +45,7 @@ export function shiftProgramState(
   state: { currentCycle: number; currentWeek: number },
   delta: number,
 ): { currentCycle: number; currentWeek: number } {
-  const absoluteWeek = Math.max(0, ((state.currentCycle - 1) * WEEKS_PER_CYCLE) + (state.currentWeek - 1) + delta);
+  const absoluteWeek = boundedWeek(((state.currentCycle - 1) * WEEKS_PER_CYCLE) + (state.currentWeek - 1) + delta);
   return { currentCycle: Math.floor(absoluteWeek / WEEKS_PER_CYCLE) + 1, currentWeek: (absoluteWeek % WEEKS_PER_CYCLE) + 1 };
 }
 

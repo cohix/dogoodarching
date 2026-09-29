@@ -150,7 +150,7 @@ export interface Me {
   id: string;
   username: string;
   role: Role;
-  /** The first (bootstrap) coach. Only the owner can invite coaches and list them. */
+  /** Current team owner. Ownership can be transferred to another coach. */
   isOwner: boolean;
 }
 
@@ -168,6 +168,7 @@ export interface AthleteSummary {
   id: string;
   username: string;
   createdAt: string;
+  deactivatedAt: string | null;
 }
 
 export interface CoachSummary {
@@ -206,7 +207,6 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   try {
     response = await fetch(path, {
       credentials: "include",
-      headers: { "Content-Type": "application/json" },
       ...init,
     });
   } catch {
@@ -227,22 +227,26 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 const get = <T>(path: string): Promise<T> => request<T>(path);
+const jsonBody = (body: unknown): RequestInit => body === undefined ? {} : {
+  headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+};
 const post = <T>(path: string, body?: unknown): Promise<T> =>
-  request<T>(path, { method: "POST", body: body === undefined ? undefined : JSON.stringify(body) });
+  request<T>(path, { method: "POST", ...jsonBody(body) });
 const put = <T>(path: string, body: unknown): Promise<T> =>
-  request<T>(path, { method: "PUT", body: JSON.stringify(body) });
-const del = <T>(path: string): Promise<T> => request<T>(path, { method: "DELETE" });
+  request<T>(path, { method: "PUT", ...jsonBody(body) });
+const del = <T>(path: string, body?: unknown): Promise<T> => request<T>(path, { method: "DELETE", ...jsonBody(body) });
 
-export function fileToBase64(file: File): Promise<{ mimeType: string; dataBase64: string }> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = String(reader.result ?? "");
-      const comma = result.indexOf(",");
-      resolve({ mimeType: file.type || "", dataBase64: comma >= 0 ? result.slice(comma + 1) : result });
-    };
-    reader.onerror = () => reject(reader.error ?? new Error("Couldn’t read that file."));
-    reader.readAsDataURL(file);
+export interface PlannedSessionFileInput {
+  dayKey: PlanDayKey;
+  kind: "document" | "photo";
+  label: string;
+  file: Blob;
+}
+
+function uploadFile(path: string, { dayKey, kind, label, file }: PlannedSessionFileInput) {
+  const query = new URLSearchParams({ dayKey, kind, label });
+  return request<{ id: number }>(`${path}?${query}`, {
+    method: "POST", headers: { "Content-Type": file.type, "X-File-Size": String(file.size) }, body: file,
   });
 }
 
@@ -252,6 +256,11 @@ export const api = {
   bootstrap: (args: { username: string; password: string }) => post<Me>("/api/auth/bootstrap", args),
   login: (args: { username: string; password: string }) => post<Me>("/api/auth/login", args),
   logout: () => post<{ ok: true }>("/api/auth/logout"),
+  changePassword: (args: { currentPassword: string; newPassword: string }) => post<{ ok: true }>("/api/auth/password", args),
+  logoutAll: () => post<{ ok: true }>("/api/auth/logout-all"),
+  deleteAccount: (args: { password: string }) => del<{ ok: true }>("/api/auth/account", args),
+  transferOwnership: (args: { coachId: string; password: string }) =>
+    post<{ ok: true; previousOwnerId: string; newOwnerId: string }>("/api/auth/owner/transfer", args),
   me: () => get<Me>("/api/auth/me"),
   // Any coach may create athlete invites; only the owner may create coach invites (403 otherwise).
   createInvite: (args: { role: Role } = { role: "athlete" }) =>
@@ -285,13 +294,7 @@ export const api = {
     post<PlannedSessionWrite>("/api/plan/sessions", args),
   addPlannedSessionLink: (args: { dayKey: PlanDayKey; label: string; url: string }) =>
     post<{ id: number }>("/api/plan/sessions/links", args),
-  addPlannedSessionFile: (args: {
-    dayKey: PlanDayKey;
-    kind: "document" | "photo";
-    label: string;
-    mimeType: string;
-    dataBase64: string;
-  }) => post<{ id: number }>("/api/plan/sessions/files", args),
+  addPlannedSessionFile: (args: PlannedSessionFileInput) => uploadFile("/api/plan/sessions/files", args),
   deletePlannedSessionAttachment: (args: { id: number }) =>
     del<{ ok: true }>(`/api/plan/attachments/${args.id}`),
   plannedSessionAttachmentFileUrl: (id: number) => `/api/plan/attachments/${id}/file`,
@@ -329,7 +332,10 @@ export const api = {
   }) => post<Inspiration>("/api/inspiration", args),
 
   // ---- coach (athlete's plans/summaries only; never private log rows) ----
-  listAthletes: () => get<{ athletes: AthleteSummary[] }>("/api/coach/athletes"),
+  listAthletes: (args: { includeDeactivated?: boolean } = {}) =>
+    get<{ athletes: AthleteSummary[] }>(`/api/coach/athletes${args.includeDeactivated ? "?include=deactivated" : ""}`),
+  deactivateAthlete: (athleteId: string) => post<AthleteSummary>(`/api/coach/athletes/${encodeURIComponent(athleteId)}/deactivate`),
+  reactivateAthlete: (athleteId: string) => post<AthleteSummary>(`/api/coach/athletes/${encodeURIComponent(athleteId)}/reactivate`),
   listCoaches: () => get<{ coaches: CoachSummary[] }>("/api/coach/coaches"), // owner only (403 otherwise)
   athleteOverview: (athleteId: string, today: string) =>
     get<CoachAthleteOverview>(
@@ -343,14 +349,8 @@ export const api = {
     post<{ id: number }>(`/api/coach/athletes/${encodeURIComponent(athleteId)}/plan/sessions/links`, args),
   coachAddPlannedSessionFile: (
     athleteId: string,
-    args: {
-      dayKey: PlanDayKey;
-      kind: "document" | "photo";
-      label: string;
-      mimeType: string;
-      dataBase64: string;
-    },
-  ) => post<{ id: number }>(`/api/coach/athletes/${encodeURIComponent(athleteId)}/plan/sessions/files`, args),
+    args: PlannedSessionFileInput,
+  ) => uploadFile(`/api/coach/athletes/${encodeURIComponent(athleteId)}/plan/sessions/files`, args),
   coachDeletePlannedSessionAttachment: (athleteId: string, attachmentId: number) =>
     del<{ ok: true }>(
       `/api/coach/athletes/${encodeURIComponent(athleteId)}/plan/attachments/${attachmentId}`,

@@ -38,10 +38,10 @@ Guidance:
 - Organize code in small, simple, modular components
 - Each component should contain unit tests that validate its behaviour in terms of inputs and outputs
 - The overall codebase should contain integration tests that validate the interation between components that are used together
-- Scope every tracker query by `user_id`. Current import ID allocation is an exception documented in [transfer design](architecture/design.md#component-6).
+- Scope every tracker query by `user_id`. Import relationship mapping and all replacement writes are scoped to the authenticated account.
 - Route coach access to an athlete's plans and summaries through `resolveAthlete`; the download authorization exception is explicit in the RBAC table below.
 - Use `batch()` for D1 writes that must be atomic; never use `transaction()`.
-- Share validation schemas between write endpoints and import. **Planned (work item 0002):** complete field-level reuse in import; its current limitations are in [security](architecture/security.md#input-validation).
+- Share field validation schemas between write endpoints and import, including calendar dates and HTTP(S) URLs; enforce import relationships and resource budgets before writes.
 
 # Personas
 
@@ -53,14 +53,21 @@ The following table is the detailed access reference. The [README roles table](.
 | Athlete plans, schedule and plan attachments | Own only | View/edit every athlete | View/edit every athlete |
 | Athlete weekly/cycle summaries | Own only | View every athlete | View every athlete |
 | Another user's individual sessions, scores, notes, setups, maintenance or inspiration | No | No | No |
-| List athletes | No | All athletes | All athletes |
+| List athletes | No | Active by default; include deactivated | Active by default; include deactivated |
 | Invite athletes | No | Yes | Yes |
 | Invite coaches and list coaches | No | No | Yes |
 | List/revoke invites | No | Own invites | All invites |
 | Download plan files | Own files | Any stored plan file | Any stored plan file |
 | Target another coach through athlete-edit endpoints | No | No | No |
+| Deactivate/reactivate athletes | No | Yes | Yes |
+| Transfer ownership to another active coach | No | No | Yes |
+| Delete own account with password | Yes | Unless last active coach | Transfer ownership first |
 
 Download authorization currently checks attachment ownership **or any coach role**, including files belonging to coach accounts. Inviter provenance grants no permissions. All cross-user exports are forbidden.
+
+Any coach may deactivate an athlete: login stops, sessions are revoked, and the default roster hides them. Data and the reserved username remain; coaches retain plan/summary access. Reactivation restores login eligibility but not old sessions. Coaches cannot be deactivated through these endpoints.
+
+An owner must transfer ownership before account deletion; the last active coach is also explicitly refused. Password-confirmed deletion removes the caller's personal rows and queues their blobs for post-commit cleanup. Deleting a non-owner coach leaves all athletes and files on their plans intact; inviter references become null and unexpired athlete invites remain usable. Old-owner or creatorless coach invites cannot be accepted. UI flows are in [experience](uxui/experience.md#signup-and-account).
 
 ### Persona 1:
 
@@ -75,7 +82,7 @@ RBAC:
 
 - Allowed: all Coach capabilities, coach invitations, the coach roster and all invite listing/revocation.
 - Disallowed: other users' private logs, cross-user export/import and targeting coach accounts through athlete endpoints.
-- **Planned (work item 0002):** transfer ownership to another coach, subject to the [account lifecycle rules](uxui/experience.md#signup-and-account).
+- Transfer ownership to another active coach with password confirmation. The guarded batch rechecks eligibility and ownership; a stale transfer fails without removing the owner.
 
 ### Persona 2:
 
@@ -89,7 +96,7 @@ Use-cases:
 
 RBAC:
 
-- Allowed: every athlete's plans and summaries, athlete invitations, own invitation management and own tracker data.
+- Allowed: every athlete's plans and summaries, athlete invitations, own invitation management, own tracker data and athlete deactivation/reactivation.
 - Disallowed: coach invitations, coach roster, other coaches' invite management and athletes' individual logs.
 
 ### Persona 3:

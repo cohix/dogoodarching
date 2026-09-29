@@ -1,0 +1,155 @@
+import { env } from "cloudflare:test";
+import { drizzle } from "drizzle-orm/d1";
+import { expect, it } from "vitest";
+import { schema } from "../../src/db";
+import { getCoachOverview, getTrackerPayload, type TrackerPayload } from "../../src/services/dashboard";
+import { plannedSessionDefaults } from "../../src/services/plan";
+import { apiJson, bootstrapTeam } from "./helpers";
+
+const overviewFields = ["cycleSummaries", "plannedSessions", "state", "weeklyArrows", "weeklyPlans"] as const;
+const secrets = {
+  notes: "PRIVATE_SESSION_NOTES_9d2e",
+  focus: "PRIVATE_SESSION_FOCUS_71ac",
+  score: "PRIVATE_SESSION_SCORE_3b8f",
+  weekly: "PRIVATE_WEEKLY_NOTE_8f10",
+  setup: "PRIVATE_BOW_SETUP_b149",
+  inspiration: "PRIVATE_INSPIRATION_0a39",
+  maintenance: "PRIVATE_MAINTENANCE_f811",
+  milestone: "PRIVATE_MILESTONE_164d",
+};
+
+function captureOverviewQueries() {
+  const queries: Array<{ sql: string; params: unknown[] }> = [];
+  const db = drizzle(env.DB, {
+    schema,
+    logger: { logQuery(sql, params) { queries.push({ sql, params: [...params] }); } },
+  });
+  return { db, queries };
+}
+
+function expectSafeQueries(queries: ReturnType<typeof captureOverviewQueries>["queries"], userId: string, start: string, end: string) {
+  // Capture only the service call, excluding seeding, auth and the athlete's
+  // dashboard. An exact table multiset also rejects new private-table reads.
+  expect(queries).toHaveLength(6);
+  expect(queries.map(({ sql }) => /from "([^"]+)"/.exec(sql)?.[1]).sort()).toEqual([
+    "cycle_week_plans", "planned_session_attachments", "planned_session_overrides",
+    "program_state", "training_sessions", "training_sessions",
+  ]);
+  for (const { sql, params } of queries) {
+    expect(sql).toMatch(/^select /);
+    expect(sql).not.toMatch(/\*|\b(?:notes|focus|score|practice_scores|practice_score_ends|weekly_notes|bow_setups|maintenance_items|maintenance_checks|milestone_checks|inspiration_entries)\b/i);
+    expect(params[0]).toBe(userId);
+  }
+  const aggregates = queries.filter(({ sql }) => sql.includes('from "training_sessions"'));
+  expect(aggregates).toHaveLength(2);
+  expect(aggregates.filter(({ sql }) => sql.startsWith('select distinct "session_date" from'))).toHaveLength(1);
+  expect(aggregates.filter(({ sql }) => sql.includes('sum("arrows")') && sql.includes("group by date("))).toHaveLength(1);
+  for (const { sql, params } of aggregates) {
+    // Check every referenced identifier, not just absence of the known secrets:
+    // individual rows, new private columns and qualified SELECT * also fail.
+    const identifiers = [...sql.matchAll(/"([^"]+)"/g)].map(match => match[1]);
+    expect([...new Set(identifiers)].sort()).toEqual(sql.startsWith("select distinct")
+      ? ["session_date", "training_sessions", "user_id"]
+      : ["arrows", "session_date", "training_sessions", "user_id"]);
+    expect(sql).toContain('"session_date" >= ?');
+    expect(sql).toContain('"session_date" < ?');
+    expect(params).toEqual([userId, start, end]);
+  }
+}
+
+it("queries only coach-safe plans and aggregates, with private seeds absent and athlete dashboard parity", async () => {
+  const { coach, athlete } = await bootstrapTeam();
+  const db = drizzle(env.DB, { schema });
+  const userId = athlete.user.id;
+  const today = "2026-01-01";
+  const updatedAt = new Date("2025-12-22T12:00:00Z");
+  await db.insert(schema.programState).values({ userId, currentPoundage: null, currentCycle: 2, currentWeek: 1, updatedAt });
+  await db.insert(schema.cycleWeekPlans).values({ userId, weekNumber: 2, primaryFocus: "Public plan focus", updatedAt });
+  await db.insert(schema.plannedSessionOverrides).values({ userId, dayKey: "mon", sessionType: "Range", detail: "Public plan detail", prescription: "60 arrows", updatedAt });
+  await db.insert(schema.plannedSessionAttachments).values([
+    { userId, dayKey: "mon", kind: "link", label: "Plan link", url: "https://example.org/plan", createdAt: updatedAt },
+    { userId, dayKey: "mon", kind: "document", label: "Plan PDF", blobKey: "plan.pdf", mimeType: "application/pdf", createdAt: updatedAt },
+  ]);
+  const datesAndArrows: Array<[string, number]> = [
+    ["2025-11-09", 9999], // Before the first cycle: excluded.
+    ["2025-11-10", 7], ["2025-11-17", 8], ["2025-11-24", 9],
+    ["2025-12-01", 10], ["2025-12-08", 11], ["2025-12-15", 12],
+    ["2025-12-28", 20], // Sunday still belongs to the previous ISO week.
+    ["2025-12-29", 40], ["2025-12-29", 60], ["2025-12-31", 0],
+    ["2026-01-03", 10], ["2026-02-01", 5],
+    ["2026-02-02", 8888], // Exclusive end of the current cycle: excluded.
+    ...Array.from({ length: 105 }, (): [string, number] => ["2025-12-29", 1]),
+  ];
+  // Individual statements stay below D1's parameter limit. More than 100
+  // sessions proves aggregation is independent of the private log page limit.
+  for (const [sessionDate, arrows] of datesAndArrows) {
+    await db.insert(schema.trainingSessions).values({ userId, sessionDate, arrows, sessionType: "Range", notes: secrets.notes, focus: secrets.focus, score: secrets.score });
+  }
+  await db.insert(schema.trainingSessions).values({ userId: coach.user.id, sessionDate: "2025-12-29", sessionType: "Range", arrows: 7777 });
+  await db.insert(schema.weeklyNotes).values({ userId, weekStart: "2025-12-29", notes: secrets.weekly });
+  await db.insert(schema.bowSetups).values({ userId, poundage: 24, name: secrets.setup });
+  await db.insert(schema.inspirationEntries).values({ userId, thoughtText: secrets.inspiration, videoTitle: "", videoUrl: "", recipeName: secrets.inspiration, recipeSummary: "", recipeIngredients: "" });
+  await db.insert(schema.maintenanceItems).values({ userId, section: "Weekly", label: secrets.maintenance });
+  await db.insert(schema.maintenanceChecks).values({ userId, key: secrets.maintenance, checked: true });
+  await db.insert(schema.milestoneChecks).values({ userId, key: secrets.milestone, checked: true });
+  const [practiceScore] = await db.insert(schema.practiceScores).values({ userId, scoreDate: today, total: 270 }).returning();
+  for (let endNumber = 1; endNumber <= 10; endNumber++) {
+    await db.insert(schema.practiceScoreEnds).values({ userId, scoreId: practiceScore!.id, endNumber, arrow1: 8, arrow2: 9, arrow3: 10, endTotal: 27 });
+  }
+
+  const captured = captureOverviewQueries();
+  const overview = await getCoachOverview(captured.db, userId, today);
+  expectSafeQueries(captured.queries, userId, "2025-11-10", "2026-02-02");
+  const route = await apiJson<typeof overview>(`/api/coach/athletes/${userId}/overview?today=${today}`, { cookie: coach.cookie });
+  expect(route.status).toBe(200);
+  expect(route.body).toEqual(overview);
+  expect(Object.keys(route.body).sort()).toEqual(overviewFields);
+  const tracker = await apiJson<TrackerPayload>(`/api/tracker?today=${today}`, { cookie: athlete.cookie });
+  expect(tracker.status).toBe(200);
+  for (const secret of Object.values(secrets)) {
+    expect(JSON.stringify(tracker.body)).toContain(secret); // Non-vacuous privacy seed.
+    expect(JSON.stringify(route.body)).not.toContain(secret);
+  }
+  for (const field of overviewFields) expect(overview[field]).toEqual(tracker.body[field]);
+  expect(overview.state).toEqual({ currentPoundage: null, currentCycle: 2, currentWeek: 2 });
+  expect(overview.weeklyArrows).toEqual([
+    { week: "2025-W47", arrows: 8 }, { week: "2025-W48", arrows: 9 },
+    { week: "2025-W49", arrows: 10 }, { week: "2025-W50", arrows: 11 },
+    { week: "2025-W51", arrows: 12 }, { week: "2025-W52", arrows: 20 },
+    { week: "2026-W01", arrows: 215 }, { week: "2026-W05", arrows: 5 },
+  ]);
+  expect(overview.cycleSummaries).toHaveLength(2);
+  expect(overview.cycleSummaries[0]!.weeks[0]).toMatchObject({ weekStart: "2025-11-10", arrows: 7 });
+  expect(overview.cycleSummaries[1]!.weeks[1]).toEqual({
+    weekNumber: 2, weekStart: "2025-12-29", arrows: 215,
+    dayStatuses: ["completed", "skipped", "completed", "upcoming", "upcoming", "completed"],
+  });
+  expect(overview.plannedSessions[0]).toMatchObject({ detail: "Public plan detail", updatedAt: updatedAt.toISOString(), attachments: [
+    { label: "Plan link", url: "https://example.org/plan" },
+    { label: "Plan PDF", url: expect.stringMatching(/^\/api\/plan\/attachments\/\d+\/file$/) },
+  ] });
+});
+
+it.each(["missing", null, 28] as const)("preserves defaults and poundage (%s) without private queries", async (poundage) => {
+  const db = drizzle(env.DB, { schema });
+  const userId = "default-athlete";
+  const today = "2026-09-28";
+  await db.insert(schema.users).values({ id: userId, username: userId, passwordHash: "unused", role: "athlete" });
+  if (poundage !== "missing") {
+    await db.insert(schema.programState).values({ userId, currentPoundage: poundage, currentCycle: 1, currentWeek: 1, updatedAt: new Date(`${today}T12:00:00Z`) });
+  }
+  const captured = captureOverviewQueries();
+  const overview = await getCoachOverview(captured.db, userId, today);
+  expectSafeQueries(captured.queries, userId, "2026-09-28", "2026-11-09");
+  const tracker = await getTrackerPayload(db, userId, today);
+  for (const field of overviewFields) expect(overview[field]).toEqual(tracker[field]);
+  expect(overview.state).toEqual({ currentPoundage: poundage === "missing" ? null : poundage, currentCycle: 1, currentWeek: 1 });
+  expect(overview.weeklyPlans).toEqual([]);
+  expect(overview.weeklyArrows).toEqual([]);
+  expect(overview.plannedSessions).toEqual(plannedSessionDefaults.map(fallback => ({ ...fallback, updatedAt: null, attachments: [] })));
+  expect(overview.cycleSummaries[0]!.weeks).toHaveLength(6);
+  for (const week of overview.cycleSummaries[0]!.weeks) {
+    expect(week.arrows).toBe(0);
+    expect(week.dayStatuses).toEqual(Array(6).fill("upcoming"));
+  }
+});

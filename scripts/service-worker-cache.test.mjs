@@ -6,6 +6,26 @@ import { build } from "vite";
 import { expect, it } from "vitest";
 import { serviceWorkerCache } from "./service-worker-cache.mjs";
 
+it("copies the static security policy unchanged with the real Vite config", async () => {
+  const outDir = await mkdtemp(join(tmpdir(), "dga-headers-"));
+  try {
+    await build({ configFile: "frontend/vite.config.ts", logLevel: "silent", build: { outDir } });
+    const policy = await readFile(new URL("../frontend/public/_headers", import.meta.url), "utf8");
+    expect(await readFile(join(outDir, "_headers"), "utf8")).toBe(policy);
+    expect(policy).toContain("/*\n");
+    expect(policy).toContain("default-src 'self'");
+    expect(policy).not.toContain("unsafe-eval");
+    const html = await readFile(join(outDir, "index.html"), "utf8");
+    // Production scripts and stylesheets are external same-origin assets.
+    for (const tag of html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/g)) {
+      expect(tag[0]).toMatch(/src="\/assets\//);
+      expect(tag[1].trim()).toBe("");
+    }
+    expect(html).not.toContain("<style");
+    expect(await readFile(join(outDir, "sw.js"), "utf8")).not.toContain("__BUILD_HASH__");
+  } finally { await rm(outDir, { recursive: true, force: true }); }
+}, 30_000);
+
 it("changes cache identity for JS, CSS, HTML, public manifest/icon and SW-only changes", async () => {
   const root = await mkdtemp(join(tmpdir(), "dga-shell-"));
   try {
@@ -62,4 +82,35 @@ it("activates over legacy caches and leaves every API request on the network", a
     handlers.fetch({ request: { url, method }, respondWith: () => { intercepted = true; } });
     expect(intercepted).toBe(false);
   }
+});
+
+it("serves invite navigation shells without redirecting or caching token URLs, online and offline", async () => {
+  const source = await readFile(new URL("../frontend/sw.js", import.meta.url), "utf8");
+  const handlers = {};
+  const cacheKeys = [];
+  let offline = false;
+  let fetched;
+  const shell = new Response("app shell");
+  vm.runInNewContext(source, {
+    URL,
+    self: { location: { origin: "https://dga.test" }, addEventListener: (name, fn) => { handlers[name] = fn; } },
+    caches: {
+      open: async () => ({ put: async (key) => { cacheKeys.push(key); } }),
+      match: async key => { expect(key).toBe("/index.html"); return shell; },
+    },
+    fetch: async request => { fetched = request; if (offline) throw Error("offline"); return shell; },
+  });
+  // Fragments aren't sent in network requests. They remain in the window URL;
+  // the service worker forwards each request as-is and never redirects clients.
+  for (const path of ["/invite", "/invite/legacy-token"]) {
+    for (const isOffline of [false, true]) {
+      offline = isOffline;
+      const request = { url: `https://dga.test${path}`, method: "GET", mode: "navigate" };
+      let result;
+      handlers.fetch({ request, respondWith: promise => { result = promise; } });
+      expect(await result).toBe(shell);
+      expect(fetched).toBe(request);
+    }
+  }
+  expect(cacheKeys).toEqual(["/index.html", "/index.html"]);
 });

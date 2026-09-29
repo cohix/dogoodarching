@@ -1,14 +1,14 @@
 // Schema migrations: 0001 → 0002 on an empty DB, on a seeded 0001 DB, on a DB
 // with no coach, and the documented orphan handling. Each test rebuilds its
 // own database from scratch, so the order of tests does not matter.
-import { env } from "cloudflare:test";
+import { applyD1Migrations, env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { hashPassword, sha256Hex } from "../../src/lib/auth";
 import { datedProgramState } from "../../src/lib/dates";
 import { DEFAULT_PROGRAM_STATE } from "../../src/services/plan";
 import { apiJson, bootstrapCoach, login, DEFAULT_PASSWORD } from "./helpers";
 import {
-  applyMigration, columnNames, columns, count, dropEverything, fkCheck, foreignKeys, indexNames, migration, rewindTo0001, scalar, user0001, userTables,
+  applyLaterMigrations, applyMigration, columnNames, columns, count, dropEverything, fkCheck, foreignKeys, indexNames, migration, rewindTo0001, scalar, user0001, userTables,
 } from "./migration-fixtures";
 
 const DAY = 86400000;
@@ -82,7 +82,8 @@ describe("migrations on an empty database", () => {
     expect(await indexNames("practice_score_ends")).toContain("idx_practice_score_ends_score");
     expect(await fkCheck()).toEqual([]);
 
-    // The migrated schema is what the Worker runs against: bootstrap works.
+    // The Worker runs against the fully migrated schema: bootstrap works.
+    await applyLaterMigrations();
     const owner = await bootstrapCoach("first");
     expect(owner.user.isOwner).toBe(true);
     expect((await apiJson("/api/auth/me", { cookie: owner.cookie })).body).toEqual(owner.user);
@@ -90,16 +91,30 @@ describe("migrations on an empty database", () => {
 
   it("the replayed schema matches the harness-applied schema exactly", async () => {
     const dump = () => env.DB.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' AND name != 'd1_migrations' ORDER BY type, name").all();
+    // Earlier tests in this file replay migrations by hand, so rebuild the
+    // baseline with the harness's own runner instead of trusting current state.
+    await dropEverything();
+    await env.DB.prepare("DELETE FROM d1_migrations").run();
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS);
     const fromHarness = (await dump()).results;
     await rewindTo0001();
     await applyMigration(migration("0002"));
+    expect(await userTables()).toContain("rate_limits"); // still present until 0003
+    await applyMigration(migration("0003"));
+    expect(await userTables()).not.toContain("rate_limits");
+    expect(await columnNames("users")).not.toContain("deactivated_at"); // added by 0004
+    await applyMigration(migration("0004"));
+    expect(await columnNames("users")).toContain("deactivated_at");
+    expect(await userTables()).toContain("blob_cleanup");
+    await applyMigration(migration("0005"));
+    await applyMigration(migration("0006"));
     expect((await dump()).results).toEqual(fromHarness);
   });
 
-  it("only the two known migrations exist and both are applied by the harness", async () => {
-    expect(env.TEST_MIGRATIONS.map((m) => m.name)).toEqual(["0001_init.sql", "0002_team_auth.sql"]);
+  it("only the six known migrations exist and all are applied by the harness", async () => {
+    expect(env.TEST_MIGRATIONS.map((m) => m.name)).toEqual(["0001_init.sql", "0002_team_auth.sql", "0003_drop_rate_limits.sql", "0004_lifecycle.sql", "0005_upload_accounting.sql", "0006_import_mapping.sql"]);
     const { results } = await env.DB.prepare("SELECT name FROM d1_migrations ORDER BY id").all<{ name: string }>();
-    expect(results.map((r) => r.name)).toEqual(["0001_init.sql", "0002_team_auth.sql"]);
+    expect(results.map((r) => r.name)).toEqual(["0001_init.sql", "0002_team_auth.sql", "0003_drop_rate_limits.sql", "0004_lifecycle.sql", "0005_upload_accounting.sql", "0006_import_mapping.sql"]);
   });
 });
 
@@ -181,6 +196,7 @@ describe("0002 on a database seeded with 0001 data", () => {
     }
     expect(await count("program_state")).toBe(4);
 
+    await applyLaterMigrations(); // the Worker needs the full schema
     // End to end: the existing session cookie still works and the tracker shows the same state as before.
     const cookie = `dga_session=${sessionToken}`;
     const me = await apiJson<{ id: string; isOwner: boolean }>("/api/auth/me", { cookie });
@@ -263,6 +279,7 @@ describe("0002 on a database with no coach", () => {
     expect(await count("users")).toBe(0);
     expect(await count("program_state")).toBe(0);
     expect(await fkCheck()).toEqual([]);
+    await applyLaterMigrations();
     const owner = await bootstrapCoach("first");
     expect(owner.user.isOwner).toBe(true);
   });

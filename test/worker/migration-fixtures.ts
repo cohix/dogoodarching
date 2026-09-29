@@ -11,7 +11,7 @@ export interface Migration {
   queries: string[];
 }
 
-export function migration(prefix: "0001" | "0002"): Migration {
+export function migration(prefix: "0001" | "0002" | "0003" | "0004" | "0005" | "0006"): Migration {
   const found = env.TEST_MIGRATIONS.find((m) => m.name.startsWith(prefix));
   if (!found) throw new Error(`migration ${prefix}_*.sql not found in TEST_MIGRATIONS (${env.TEST_MIGRATIONS.map((m) => m.name).join(", ")})`);
   return found;
@@ -98,4 +98,16 @@ export async function count(table: string, where = "1 = 1", ...binds: unknown[])
 export function user0001(id: string, username: string, role: "coach" | "athlete", coachId: string | null, createdAt: number, passwordHash = "hash") {
   return env.DB.prepare("INSERT INTO users (id, username, password_hash, role, coach_id, created_at) VALUES (?, ?, ?, ?, ?, ?)")
     .bind(id, username, passwordHash, role, coachId, createdAt);
+}
+
+/**
+ * Applies every migration after 0002 (0003 drop rate_limits, 0004 lifecycle).
+ * The Worker's queries expect the full schema (e.g. `users.deactivated_at`),
+ * so tests that call the API after replaying 0002 by hand run this first.
+ */
+export async function applyLaterMigrations(): Promise<void> {
+  await applyMigration(migration("0003"));
+  await applyMigration(migration("0004"));
+  await applyMigration(migration("0005"));
+  await applyMigration(migration("0006"));
 }

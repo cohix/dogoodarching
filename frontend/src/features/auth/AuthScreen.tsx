@@ -1,6 +1,7 @@
 import { type FormEvent, useState, useEffect } from "react";
 import { api, ApiError } from "../../api";
 import { useQueryClient } from "@tanstack/react-query";
+import { resetAccount } from "../../lib/account";
 
 function AuthFormCard({ title, subtitle, submitLabel, pending, error, onSubmit, username, setUsername, password, setPassword }: {
   title: string; subtitle: string; submitLabel: string; pending: boolean; error: string;
@@ -23,6 +24,7 @@ function AuthFormCard({ title, subtitle, submitLabel, pending, error, onSubmit, 
 }
 
 export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
+  const qc = useQueryClient();
   const [mode, setMode] = useState<"checking" | "bootstrap" | "login">("checking");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -42,8 +44,10 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
     if (password.length < 8) { setError("Password must be at least 8 characters."); return; }
     setPending(true);
     try {
-      if (mode === "bootstrap") await api.bootstrap({ username, password });
-      else await api.login({ username, password });
+      const me = mode === "bootstrap"
+        ? await api.bootstrap({ username, password })
+        : await api.login({ username, password });
+      resetAccount(qc, me);
       onAuthed();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Something went wrong. Try again.");
@@ -90,8 +94,8 @@ export function InviteAcceptScreen({ token, onDone }: { token: string; onDone: (
     if (password.length < 8) { setError("Password must be at least 8 characters."); return; }
     setPending(true);
     try {
-      await api.acceptInvite({ token, username, password });
-      await qc.invalidateQueries({ queryKey: ["me"] });
+      const me = await api.acceptInvite({ token, username, password });
+      resetAccount(qc, me);
       onDone();
     } catch (err) {
       if (err instanceof ApiError && err.status === 410) {

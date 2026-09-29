@@ -15,6 +15,34 @@
       "when": 1790608199469,
       "tag": "0002_team_auth",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1790621358522,
+      "tag": "0003_drop_rate_limits",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1790623152552,
+      "tag": "0004_lifecycle",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1790624369017,
+      "tag": "0005_upload_accounting",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1790635519794,
+      "tag": "0006_import_mapping",
+      "breakpoints": true
     }
   ]
 }

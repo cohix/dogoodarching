@@ -17,7 +17,7 @@ Reasoning: `invited_by` records provenance rather than creating separate rosters
 ### Principle 3
 
 Description: coach responses contain only plan and aggregate data.  
-Reasoning: private logs must never reach coaches. Currently `getCoachOverview` filters the full tracker result server-side. **Planned (work item 0002):** enforce the boundary at query level too, with dedicated plan and aggregate queries that never select private log columns (see [security](security.md#api-security)).
+Reasoning: private logs must never reach coaches. `getCoachOverview` enforces the boundary with dedicated plan and aggregate queries that never select private log columns (see [security](security.md#api-security)).
 
 ### Principle 4
 
@@ -57,12 +57,13 @@ flowchart TD
     subgraph Worker["Worker instance in each environment"]
         Routes["Hono routes and middleware"] --> Services["Domain services"]
         Services --> Drizzle["Drizzle ORM"]
-        Cleanup["Scheduled cleanup handler - planned 0002"] --> Drizzle
+        Cleanup["Scheduled cleanup handler"] --> Drizzle
     end
     Drizzle --> D1[("D1 database")]
     Services --> R2[("Private R2 attachments")]
-    Cron["Cron Trigger - planned 0002"] -.-> Cleanup
-    Routes -.-> Rate["Rate Limiting binding - planned 0002"]
+    Cleanup --> R2
+    Cron["Cron Trigger"] -.-> Cleanup
+    Routes -.-> Rate["Rate Limiting bindings"]
     Assets --> Browser
 ```
 
@@ -72,7 +73,7 @@ flowchart TD
 
 Name: Worker entry/router  
 Purpose: route requests and normalize errors.  
-Description and Scope: `src/index.ts` mounts `routes/auth.ts` at `/api/auth`, `routes/coach.ts` at `/api/coach`, and `routes/tracker.ts` plus `routes/transfer.ts` at `/api`. It exports `fetch`, with JSON not-found and unexpected-error handlers. `lib/http.ts` owns validators, integer parsing and download filename construction; no scheduled handler exists yet.
+Description and Scope: `src/index.ts` mounts `routes/auth.ts` at `/api/auth`, `routes/coach.ts` at `/api/coach`, and `routes/tracker.ts` plus `routes/transfer.ts` at `/api`. It exports `fetch` and `scheduled`, with outer API security headers, the same-origin guard, JSON not-found and public-error handling. `lib/http.ts` owns validators, integer parsing and download filename construction; `scheduled` delegates to `services/cleanup.ts` for [bounded cleanup and size backfill](../devops/operations.md#scheduled-cleanup-jobs).
 
 ### Component 2:
 
@@ -83,8 +84,8 @@ Description and Scope: `lib/auth.ts` provides WebCrypto and cookies, `lib/rbac.t
 ### Component 3:
 
 Name: rate limiting  
-Purpose: bound authentication attempts.  
-Description and Scope: `lib/rate-limit.ts` implements D1-backed middleware. Current limits, atomic counting and the planned replacement are in [security](security.md#rate-limiting).
+Purpose: bound authentication, password verification, invitations and uploads.  
+Description and Scope: `lib/rate-limit.ts` selects the native Workers bindings. Operation keys, approximate counters and fail-closed behavior are in [security](security.md#rate-limiting).
 
 ### Component 4:
 
@@ -100,21 +101,21 @@ New-state and starter-plan presentation is described in [experience](../uxui/exp
 
 Name: coach routes  
 Purpose: shared team roster and athlete plan editing.  
-Description and Scope: `routes/coach.ts` uses `services/team.ts`, the plan/attachment services and `dashboard.getCoachOverview`. Athlete-targeted calls require `resolveAthlete`. The overview exposes `state`, `weeklyPlans`, `plannedSessions`, `weeklyArrows` and `cycleSummaries`; its current query-level limitation is in Principle 3.
+Description and Scope: `routes/coach.ts` uses `services/team.ts`, the plan/attachment services and `dashboard.getCoachOverview`. Athlete-targeted calls require `resolveAthlete`. The overview exposes `state`, `weeklyPlans`, `plannedSessions`, `weeklyArrows` and `cycleSummaries`; its query-level privacy rule is in [security](security.md#api-security).
 
 ### Component 6:
 
 Name: import/export  
 Purpose: per-account data portability.  
-Description and Scope: `routes/transfer.ts` delegates to `services/transfer.ts`; the [JSON format](../uxui/interface.md#usage) is version 1. Import deletes/reinserts the caller's D1 data in one batch, remaps IDs from global high-water marks, and deletes old R2 files **before** the batch. Insert chunks are sized from their generated SQL parameter count, at most 100 binds per statement, while the D1 replacement remains atomic. ID high-water queries are currently unscoped; they read maxima, not other users' records into the response. Concurrent ID collisions and loss of R2 files on failed imports remain possible.
+Description and Scope: `routes/transfer.ts` delegates to `services/transfer.ts`; exports retain version 1. AUTOINCREMENT assigns IDs. Temporary per-import UUID/source-ID keys on score and maintenance parents resolve child references inside one D1 batch, then are cleared before commit. Every statement checks that the actor is still active. The same batch records the keys of the actual attachments it replaces in durable cleanup, including concurrent coach uploads. R2 deletion happens only after commit; failure is logged and retried by cron while import still succeeds. Rollback leaves existing rows and referenced files intact.
 
-**Planned (work item 0002):** remove global ID preallocation, delete replaced blobs only after successful D1 writes, and harden validation and overall import limits; see [security](security.md#planned-work-item-0002).
+The complete replacement must fit 40 D1 statements, including guards, cleanup enqueue and mapping removal. JSON row chunks contain at most 1,000 rows and 128,000 UTF-8 bytes; each statement is preflighted for 100 bound parameters, 100,000 SQL bytes and 128,000 bytes per bound string. This deliberately fits the Free plan’s 50-query invocation budget, including authentication and one prompt blob-cleanup attempt, and also works on Paid. Effective capacity depends on row widths and populated collections: the row caps are ceilings, not a promise that every combination fits. Oversize requests/batches return 413 before any destructive write. The operation is never split across committed batches. See [import validation](security.md#import-hardening) for field and array limits.
 
 ### Component 7:
 
 Name: attachments (R2)  
 Purpose: links, documents and photos on plan days.  
-Description and Scope: `services/attachments.ts` stores link metadata in D1 and file bytes in R2 under user/UUID keys. Upload puts the blob then inserts metadata, attempting blob cleanup if insertion fails. Removal deletes the blob before its row. [Security](security.md#file-attachments) defines download checks and headers.
+Description and Scope: `services/attachments.ts` stores link metadata in D1 and file bytes in R2 under user/UUID keys. Upload reads one chunk at a time into a counted `FixedLengthStream` consumed by R2, awaiting writer backpressure. There is no whole-file buffer. Browser File requests send `X-File-Size`; absent both size headers is rejected before reading, both present must agree, and actual bytes/EOF are checked. A conditional D1 admission counts committed files and live reservations atomically. One-hour `upload_reservations` and delayed `blob_cleanup` records precede R2 put; commit rechecks the active actor and lease, inserts metadata and removes recovery records in one batch. Failed settled operations release quota and attempt cleanup; interrupted operations retain durable recovery. Deactivated athletes remain valid coach targets. Attachment removal queues keys and deletes rows in one batch, then touches R2. [Operations](../devops/operations.md#scheduled-cleanup-jobs) owns retry/tombstone policy. [Security](security.md#file-attachments) defines download checks and headers.
 
 ### Component 8:
 
@@ -126,7 +127,7 @@ Description and Scope: `db/index.ts` binds D1 to Drizzle, `db/schema.ts` declare
 
 Name: SPA  
 Purpose: athlete and coach user interface.  
-Description and Scope: `frontend/src/App.tsx` handles invite routing, auth gating, queries and tab mounts. Features live in `features/{auth,dashboard,log,plan,gear,fuel,team,settings}/`; shared UI is in `components/`, utilities in `lib/`, and `api.ts` is the typed fetch client. TanStack Query invalidation refreshes data after mutations; the UI does not make optimistic cache writes. Missing-row mutation responses trigger refetch and appropriate editor closure. Training history discards older pages after mutations and tracker refreshes, including an identical first page; a generation counter rejects responses started before that invalidation. See [interface](../uxui/interface.md).
+Description and Scope: `frontend/src/App.tsx` handles invite routing, auth gating, queries and tab mounts. Features live in `features/{auth,dashboard,log,plan,gear,fuel,team,settings}/`; shared UI is in `components/`, utilities in `lib/`, and `api.ts` is the typed fetch client. TanStack Query invalidation refreshes training data after mutations. Account transitions clear caches and cancel old reads; a successful ownership transfer immediately updates cached owner status before confirming it through `/me`. See [account experience](../uxui/experience.md#signup-and-account). Missing-row mutation responses trigger refetch and appropriate editor closure. Training history discards older pages after mutations and tracker refreshes, including an identical first page; a generation counter rejects responses started before that invalidation. See [interface](../uxui/interface.md).
 
 ### Component 10:
 
@@ -140,14 +141,15 @@ Source: [schema.ts](../../src/db/schema.ts).
 
 | Group | Tables and relationships |
 |---|---|
-| Auth | `users`, `sessions`, `invites`, `rate_limits`. Users have UUID IDs, case-insensitive unique usernames, `role`, `is_owner` (default false) and nullable `invited_by`. A partial unique index permits at most one owner. Invites carry `role` (default athlete) and nullable `created_by`. |
+| Auth | `users`, `sessions`, `invites`. Users have UUID IDs, case-insensitive unique usernames, `role`, `is_owner` (default false) and nullable `invited_by` and `deactivated_at`. A partial unique index permits at most one owner. Invites carry `role` (default athlete) and nullable `created_by`. |
 | Tracker | `training_sessions`, `practice_scores`, `practice_score_ends`, `weekly_notes`, `bow_setups`, `milestone_checks`, `maintenance_checks`, `maintenance_items`, `inspiration_entries`. Each has `user_id`; score ends also reference their parent score. |
-| Plan | `program_state`, `cycle_week_plans`, `planned_session_overrides`, `planned_session_attachments`. Each has `user_id`; plans use per-user week/day keys. Program poundage is nullable. |
+| Plan | `program_state`, `cycle_week_plans`, `planned_session_overrides`, `planned_session_attachments`. Each has `user_id`; plans use per-user week/day keys. Program poundage is nullable. Attachments have nullable `size_bytes` and `size_checked_at` (unknown legacy sizes until backfilled). |
+| Recovery | `blob_cleanup`: blob-key PK, reason, attempts, last error and retry/creation timestamps; `upload_reservations`: blob-key PK, target `user_id`, `actor_id`, `size_bytes`, expiry. Neither has a user FK, so recovery survives account deletion. |
 
-Every `user_id` references `users(id) ON DELETE CASCADE`; score ends also cascade on score deletion. `users.invited_by` and `invites.created_by` reference users with `ON DELETE SET NULL`. R2 objects are not covered by SQL cascades. `rate_limits` has a key/window/attempt count rather than a user FK. The unused `entries` table has been removed. Migration/backfill behavior is documented in [operations](../devops/operations.md#ongoing-operations).
+Tracker/plan and session `user_id` columns reference `users(id) ON DELETE CASCADE`; score ends also cascade on score deletion. `users.invited_by` and `invites.created_by` reference users with `ON DELETE SET NULL`. R2 objects are not covered by SQL cascades. `rate_limits` was dropped by 0003. Migration 0004 adds deactivation/cleanup; 0005 adds upload accounting. Migration 0006 adds nullable `import_key` columns with per-user unique indexes to scores and maintenance items; these ephemeral mappings are set and cleared in the atomic import batch. The unused `entries` table has been removed. Migration/backfill behavior is documented in [operations](../devops/operations.md#ongoing-operations).
 
 ## Timestamp convention
 
-Instants are epoch-millisecond SQLite integers mapped by Drizzle `timestamp_ms` to `Date`, including session/invite expiry. `rate_limits.window_start` deliberately remains a raw numeric epoch-ms counter anchor for arithmetic. Calendar dates are `YYYY-MM-DD` strings in the athlete's local calendar, supplied by the client as `today`. Helpers use UTC arithmetic to avoid DST drift; absent `today`, the API defaults to the server UTC date. Program `updated_at` is the calendar progression anchor. [API conventions](apis.md#design) describe wire encodings, including the invite-list exception.
+Instants are epoch-millisecond SQLite integers mapped by Drizzle `timestamp_ms` to `Date`, including session/invite expiry. Cleanup deadlines, reservation expiry and size-check/deactivation instants follow the same convention. Calendar dates are `YYYY-MM-DD` strings in the athlete's local calendar, supplied by the client as `today`. Helpers use UTC arithmetic to avoid DST drift; absent `today`, the API defaults to the server UTC date. Program `updated_at` is the calendar progression anchor. [API conventions](apis.md#design) describe wire encodings, including the invite-list exception.
 
 New/default program state and initial poundage saves anchor to noon UTC on the client-supplied calendar day, keeping cycle 1/week 1 even when local Monday precedes UTC Monday. Existing and backfilled anchors remain unchanged. Schedule adjustments use the same calendar fallback.

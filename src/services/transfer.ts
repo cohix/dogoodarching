@@ -6,10 +6,12 @@
 // Import replaces ALL of the caller's data in a single D1 batch, remapping
 // ids, and never touches other users' rows.
 
-import { and, asc, eq, max, ne } from "drizzle-orm";
+import { and, asc, eq, getTableColumns, sql } from "drizzle-orm";
 import type { BatchItem } from "drizzle-orm/batch";
 import { schema, type Db } from "../db";
-import type { ImportData } from "../lib/validation";
+import { importPayloadSchema, type ImportData } from "../lib/validation";
+import { UserFacingError, zodErrorMessage } from "../lib/http";
+import { attemptBlobCleanup, enqueueBlobCleanupFromAttachments } from "./cleanup";
 
 export const EXPORT_VERSION = 1 as const;
 
@@ -96,215 +98,131 @@ export function exportFilename(now: Date = new Date()): string {
   return `dga-export-${now.toISOString().slice(0, 10).replace(/-/g, "")}.json`;
 }
 
-// D1 limits each statement to 100 bind parameters, not 100 rows. Count the
-// generated parameters, including remapped IDs and defaults, before batching.
-function insertChunks<T>(rows: T[], insert: (rows: T[]) => BatchItem<"sqlite"> & { toSQL(): { params: unknown[] } }): BatchItem<"sqlite">[] {
-  const out: BatchItem<"sqlite">[] = [];
-  for (let offset = 0; offset < rows.length;) {
-    let size = Math.min(100, rows.length - offset);
-    let statement = insert(rows.slice(offset, offset + size));
-    while (statement.toSQL().params.length > 100) {
-      if (size === 1) throw new Error("An import row exceeds D1's bind limit");
-      size = Math.floor(size / 2);
-      statement = insert(rows.slice(offset, offset + size));
+// Portably fits the Free plan's 50-query invocation ceiling, leaving ten
+// queries for authentication and a bounded prompt cleanup attempt. Paid uses
+// the same limit. Never split a replacement across committed batches.
+export const MAX_IMPORT_BYTES = 8_000_000;
+export const MAX_IMPORT_STATEMENTS = 40;
+export const MAX_IMPORT_SQL_BYTES = 100_000;
+export const MAX_IMPORT_VALUE_BYTES = 128_000;
+const MAX_CHUNK_ROWS = 1_000;
+const encoder = new TextEncoder();
+type ImportRow = Record<string, string | number | boolean | null>;
+type Statement = BatchItem<"sqlite"> & { toSQL(): { sql: string; params: unknown[] } };
+
+/** Complete preflight before any write, including cleanup enqueue/deletes. */
+export function preflightImport(statements: readonly { sql: string; params: unknown[] }[]): void {
+  if (statements.length > MAX_IMPORT_STATEMENTS) throw new UserFacingError(413, `Import exceeds the ${MAX_IMPORT_STATEMENTS}-statement atomic batch budget; reduce the exported history`);
+  for (const statement of statements) {
+    if (encoder.encode(statement.sql).length > MAX_IMPORT_SQL_BYTES || statement.params.length > 100) {
+      throw new UserFacingError(413, "Import exceeds the SQL statement budget");
     }
-    out.push(statement);
-    offset += size;
+    for (const value of statement.params) {
+      if (typeof value === "string" && encoder.encode(value).length > MAX_IMPORT_VALUE_BYTES) {
+        throw new UserFacingError(413, "Import value exceeds 128000 bytes");
+      }
+    }
   }
-  return out;
 }
 
-export async function importUserData(db: Db, bucket: R2Bucket, userId: string, data: ImportData) {
-  // Global high-water marks so remapped ids cannot collide with other users' rows.
-  const [mSessions, mScores, mEnds, mNotes, mItems, mSetups, mInspiration, mAttachments] = await Promise.all([
-    db.select({ m: max(schema.trainingSessions.id) }).from(schema.trainingSessions),
-    db.select({ m: max(schema.practiceScores.id) }).from(schema.practiceScores),
-    db.select({ m: max(schema.practiceScoreEnds.id) }).from(schema.practiceScoreEnds),
-    db.select({ m: max(schema.weeklyNotes.id) }).from(schema.weeklyNotes),
-    db.select({ m: max(schema.maintenanceItems.id) }).from(schema.maintenanceItems),
-    db.select({ m: max(schema.bowSetups.id) }).from(schema.bowSetups),
-    db.select({ m: max(schema.inspirationEntries.id) }).from(schema.inspirationEntries),
-    db.select({ m: max(schema.plannedSessionAttachments.id) }).from(schema.plannedSessionAttachments),
-  ]);
-  const counters: Record<string, number> = {
-    trainingSessions: mSessions[0]?.m ?? 0,
-    practiceScores: mScores[0]?.m ?? 0,
-    practiceScoreEnds: mEnds[0]?.m ?? 0,
-    weeklyNotes: mNotes[0]?.m ?? 0,
-    maintenanceItems: mItems[0]?.m ?? 0,
-    bowSetups: mSetups[0]?.m ?? 0,
-    inspirationEntries: mInspiration[0]?.m ?? 0,
-    plannedSessionAttachments: mAttachments[0]?.m ?? 0,
-  };
-  const idMaps: Record<string, Map<number, number>> = {};
-  const nextId = (table: string): number => {
-    counters[table] = (counters[table] ?? 0) + 1;
-    return counters[table] as number;
-  };
-  const recordId = (table: string, oldId: number, newId: number): void => {
-    (idMaps[table] ??= new Map()).set(oldId, newId);
-  };
-  const remapped = (table: string, oldId: number): number | undefined => idMaps[table]?.get(oldId);
-
-  const newTrainingSessions = data.trainingSessions.map((r) => {
-    const id = nextId("trainingSessions");
-    recordId("trainingSessions", r.id, id);
-    return {
-      id, userId, sessionDate: r.sessionDate, sessionType: r.sessionType, customActivity: r.customActivity,
-      arrows: r.arrows, durationMinutes: r.durationMinutes, focus: r.focus, score: r.score,
-      notes: r.notes, createdAt: new Date(r.createdAt),
-    };
-  });
-  const newPracticeScores = data.practiceScores.map((r) => {
-    const id = nextId("practiceScores");
-    recordId("practiceScores", r.id, id);
-    return { id, userId, scoreDate: r.scoreDate, total: r.total, createdAt: new Date(r.createdAt) };
-  });
-  const newPracticeScoreEnds = data.practiceScoreEnds
-    .filter((r) => remapped("practiceScores", r.scoreId) !== undefined)
-    .map((r) => {
-      const id = nextId("practiceScoreEnds");
-      recordId("practiceScoreEnds", r.id, id);
-      return {
-        id, userId, scoreId: remapped("practiceScores", r.scoreId) as number, endNumber: r.endNumber,
-        arrow1: r.arrow1, arrow2: r.arrow2, arrow3: r.arrow3, endTotal: r.endTotal,
-      };
-    });
-  const newProgramState = data.programState
-    ? [{
-        userId, currentPoundage: data.programState.currentPoundage, currentCycle: data.programState.currentCycle,
-        currentWeek: data.programState.currentWeek, updatedAt: new Date(data.programState.updatedAt),
-      }]
-    : [];
-  const newCycleWeekPlans = data.cycleWeekPlans.map((r) => ({
-    userId, weekNumber: r.weekNumber, primaryFocus: r.primaryFocus,
-    backgroundFocusOne: r.backgroundFocusOne, backgroundFocusTwo: r.backgroundFocusTwo,
-    updatedAt: new Date(r.updatedAt),
-  }));
-  const newPlannedSessionOverrides = data.plannedSessionOverrides.map((r) => ({
-    userId, dayKey: r.dayKey, sessionType: r.sessionType, detail: r.detail,
-    prescription: r.prescription, updatedAt: new Date(r.updatedAt),
-  }));
-  const newPlannedSessionAttachments = data.plannedSessionAttachments.map((r) => {
-    const id = nextId("plannedSessionAttachments");
-    recordId("plannedSessionAttachments", r.id, id);
-    return {
-      id, userId, dayKey: r.dayKey, kind: r.kind, label: r.label, url: r.url,
-      blobKey: "", mimeType: r.mimeType, createdAt: new Date(r.createdAt),
-    };
-  });
-  const newMilestoneChecks = data.milestoneChecks.map((r) => ({
-    userId, key: r.key, checked: r.checked, updatedAt: new Date(r.updatedAt),
-  }));
-  const newMaintenanceItems = data.maintenanceItems.map((r) => {
-    const id = nextId("maintenanceItems");
-    recordId("maintenanceItems", r.id, id);
-    return {
-      id, userId, section: r.section, label: r.label, sortOrder: r.sortOrder,
-      createdAt: new Date(r.createdAt), updatedAt: new Date(r.updatedAt),
-    };
-  });
-  const newMaintenanceChecks = data.maintenanceChecks.map((r) => {
-    const match = /^item:(\d+)$/.exec(r.key);
-    const key = match ? `item:${remapped("maintenanceItems", Number(match[1])) ?? match[1]}` : r.key;
-    return { userId, key, checked: r.checked, updatedAt: new Date(r.updatedAt) };
-  });
-  const newInspirationEntries = data.inspirationEntries.map((r) => {
-    const id = nextId("inspirationEntries");
-    recordId("inspirationEntries", r.id, id);
-    return {
-      id, userId, thoughtText: r.thoughtText, videoTitle: r.videoTitle, videoUrl: r.videoUrl,
-      recipeName: r.recipeName, recipeSummary: r.recipeSummary, recipeIngredients: r.recipeIngredients,
-      recipeInstructions: r.recipeInstructions, updatedAt: new Date(r.updatedAt),
-    };
-  });
-  const newWeeklyNotes = data.weeklyNotes.map((r) => {
-    const id = nextId("weeklyNotes");
-    recordId("weeklyNotes", r.id, id);
-    return {
-      id, userId, weekStart: r.weekStart, notes: r.notes,
-      createdAt: new Date(r.createdAt), updatedAt: new Date(r.updatedAt),
-    };
-  });
-  const newBowSetups = data.bowSetups.map((r) => {
-    const id = nextId("bowSetups");
-    recordId("bowSetups", r.id, id);
-    return {
-      id, userId, poundage: r.poundage, name: r.name, limbRiser: r.limbRiser, tillerBolts: r.tillerBolts,
-      braceHeight: r.braceHeight, stringTwists: r.stringTwists, nockingPoint: r.nockingPoint,
-      centerShot: r.centerShot, plunger: r.plunger, gripNotes: r.gripNotes, stabilizer: r.stabilizer,
-      clickerPosition: r.clickerPosition, bareShaft: r.bareShaft, walkBack: r.walkBack,
-      arrowsInUse: r.arrowsInUse, sightMarksJson: r.sightMarksJson,
-      updatedAt: new Date(r.updatedAt),
-    };
-  });
-
-  // Import replaces the caller's plan attachments (only link attachments are
-  // ever imported), so delete the R2 blobs of their existing file attachments
-  // first — otherwise the rows would be dropped by the batch below while the
-  // blobs linger in R2 unreachable and unbillable-but-uncollectible.
-  const orphanBlobs = await db
-    .select({ blobKey: schema.plannedSessionAttachments.blobKey })
-    .from(schema.plannedSessionAttachments)
-    .where(
-      and(
-        eq(schema.plannedSessionAttachments.userId, userId),
-        ne(schema.plannedSessionAttachments.blobKey, ""),
-      ),
-    );
-  await Promise.all(orphanBlobs.map((r) => bucket.delete(r.blobKey)));
-
-  // One D1 batch: delete everything the caller owns (children first), then
-  // re-insert the imported rows with remapped ids. Other users' rows are
-  // never touched. Insert statements are chunked so no statement is oversized.
-  const statements: BatchItem<"sqlite">[] = [
-    db.delete(schema.practiceScoreEnds).where(eq(schema.practiceScoreEnds.userId, userId)),
-    db.delete(schema.practiceScores).where(eq(schema.practiceScores.userId, userId)),
-    db.delete(schema.plannedSessionAttachments).where(eq(schema.plannedSessionAttachments.userId, userId)),
-    db.delete(schema.plannedSessionOverrides).where(eq(schema.plannedSessionOverrides.userId, userId)),
-    db.delete(schema.cycleWeekPlans).where(eq(schema.cycleWeekPlans.userId, userId)),
-    db.delete(schema.trainingSessions).where(eq(schema.trainingSessions.userId, userId)),
-    db.delete(schema.milestoneChecks).where(eq(schema.milestoneChecks.userId, userId)),
-    db.delete(schema.maintenanceChecks).where(eq(schema.maintenanceChecks.userId, userId)),
-    db.delete(schema.maintenanceItems).where(eq(schema.maintenanceItems.userId, userId)),
-    db.delete(schema.inspirationEntries).where(eq(schema.inspirationEntries.userId, userId)),
-    db.delete(schema.weeklyNotes).where(eq(schema.weeklyNotes.userId, userId)),
-    db.delete(schema.bowSetups).where(eq(schema.bowSetups.userId, userId)),
-    db.delete(schema.programState).where(eq(schema.programState.userId, userId)),
-    ...insertChunks(newTrainingSessions, (rows) => db.insert(schema.trainingSessions).values(rows)),
-    ...insertChunks(newPracticeScores, (rows) => db.insert(schema.practiceScores).values(rows)),
-    ...insertChunks(newPracticeScoreEnds, (rows) => db.insert(schema.practiceScoreEnds).values(rows)),
-    ...insertChunks(newCycleWeekPlans, (rows) => db.insert(schema.cycleWeekPlans).values(rows)),
-    ...insertChunks(newPlannedSessionOverrides, (rows) => db.insert(schema.plannedSessionOverrides).values(rows)),
-    ...insertChunks(newPlannedSessionAttachments, (rows) => db.insert(schema.plannedSessionAttachments).values(rows)),
-    ...insertChunks(newMilestoneChecks, (rows) => db.insert(schema.milestoneChecks).values(rows)),
-    ...insertChunks(newMaintenanceChecks, (rows) => db.insert(schema.maintenanceChecks).values(rows)),
-    ...insertChunks(newMaintenanceItems, (rows) => db.insert(schema.maintenanceItems).values(rows)),
-    ...insertChunks(newInspirationEntries, (rows) => db.insert(schema.inspirationEntries).values(rows)),
-    ...insertChunks(newWeeklyNotes, (rows) => db.insert(schema.weeklyNotes).values(rows)),
-    ...insertChunks(newBowSetups, (rows) => db.insert(schema.bowSetups).values(rows)),
-    ...insertChunks(newProgramState, (rows) => db.insert(schema.programState).values(rows)),
-  ];
-  if (statements.length > 0) {
-    await db.batch(statements as [BatchItem<"sqlite">, ...BatchItem<"sqlite">[]]);
+function jsonChunks(rows: ImportRow[]): string[] {
+  const chunks: string[] = [];
+  let current: string[] = [];
+  let bytes = 2;
+  for (const row of rows) {
+    const text = JSON.stringify(row);
+    const size = encoder.encode(text).length;
+    if (size + 2 > MAX_IMPORT_VALUE_BYTES) throw new UserFacingError(413, "Import row exceeds 128000 bytes");
+    if (current.length && (bytes + size + 1 > MAX_IMPORT_VALUE_BYTES || current.length >= MAX_CHUNK_ROWS)) {
+      chunks.push(`[${current.join(",")}]`);
+      current = [];
+      bytes = 2;
+    }
+    current.push(text);
+    bytes += size + 1;
   }
+  if (current.length) chunks.push(`[${current.join(",")}]`);
+  return chunks;
+}
 
-  return {
-    ok: true as const,
-    counts: {
-      trainingSessions: newTrainingSessions.length,
-      practiceScores: newPracticeScores.length,
-      practiceScoreEnds: newPracticeScoreEnds.length,
-      programState: newProgramState.length,
-      cycleWeekPlans: newCycleWeekPlans.length,
-      plannedSessionOverrides: newPlannedSessionOverrides.length,
-      plannedSessionAttachments: newPlannedSessionAttachments.length,
-      milestoneChecks: newMilestoneChecks.length,
-      maintenanceChecks: newMaintenanceChecks.length,
-      maintenanceItems: newMaintenanceItems.length,
-      inspirationEntries: newInspirationEntries.length,
-      weeklyNotes: newWeeklyNotes.length,
-      bowSetups: newBowSetups.length,
-    },
+export async function importUserData(db: Db, bucket: R2Bucket, userId: string, supplied: ImportData) {
+  // Services also validate: direct callers must not bypass HTTP invariants.
+  const validated = importPayloadSchema.safeParse({ version: 1, data: supplied });
+  if (!validated.success) throw new UserFacingError(400, zodErrorMessage(validated.error, true));
+  const data = validated.data.data;
+  const importId = crypto.randomUUID();
+  const active = sql`EXISTS (SELECT 1 FROM users WHERE id = ${userId} AND deactivated_at IS NULL)`;
+  const tables = {
+    practiceScoreEnds: schema.practiceScoreEnds,
+    practiceScores: schema.practiceScores,
+    plannedSessionAttachments: schema.plannedSessionAttachments,
+    plannedSessionOverrides: schema.plannedSessionOverrides,
+    cycleWeekPlans: schema.cycleWeekPlans,
+    trainingSessions: schema.trainingSessions,
+    milestoneChecks: schema.milestoneChecks,
+    maintenanceChecks: schema.maintenanceChecks,
+    maintenanceItems: schema.maintenanceItems,
+    inspirationEntries: schema.inspirationEntries,
+    weeklyNotes: schema.weeklyNotes,
+    bowSetups: schema.bowSetups,
+    programState: schema.programState,
   };
+  const statements: Statement[] = [
+    db.select({ id: schema.users.id }).from(schema.users).where(and(eq(schema.users.id, userId), active)),
+    enqueueBlobCleanupFromAttachments(db, and(eq(schema.plannedSessionAttachments.userId, userId), active)!, { reason: "import" })
+      .returning({ blobKey: schema.blobCleanup.blobKey }),
+    ...Object.values(tables).map((table) => db.delete(table).where(and(eq(table.userId, userId), active))),
+  ];
+  // Parents first. Each parent has an unambiguous import UUID/source-id key;
+  // children resolve it inside this same batch. No connection-local state or
+  // precomputed database IDs, and duplicate dates/labels are allowed.
+  const order = ["trainingSessions", "practiceScores", "maintenanceItems", "practiceScoreEnds", "maintenanceChecks",
+    "cycleWeekPlans", "plannedSessionOverrides", "plannedSessionAttachments", "milestoneChecks",
+    "inspirationEntries", "weeklyNotes", "bowSetups", "programState"] as const;
+  for (const name of order) {
+    const table = tables[name];
+    const collection = name === "programState" ? (data.programState ? [data.programState] : []) : data[name];
+    const rows: ImportRow[] = collection.map((row) => {
+      const result: ImportRow = { ...row, userId };
+      delete result.id;
+      for (const field of ["createdAt", "updatedAt"]) {
+        if (typeof result[field] === "string") result[field] = Date.parse(result[field]);
+      }
+      if (name === "practiceScores" || name === "maintenanceItems") result.importKey = `${importId}:${"id" in row ? row.id : ""}`;
+      if (name === "plannedSessionAttachments") result.blobKey = "";
+      return result;
+    });
+    const columns = Object.keys(getTableColumns(table));
+    const projections = columns.map((field) => {
+      // All field names are trusted schema identifiers, never request input.
+      const value = sql`json_extract(incoming.value, ${`$.${field}`})`;
+      if (name === "practiceScoreEnds" && field === "scoreId") {
+        return sql`(SELECT id FROM practice_scores WHERE user_id = ${userId} AND import_key = ${importId + ":"} || ${value})`;
+      }
+      if (name === "maintenanceChecks" && field === "key") {
+        return sql`CASE WHEN ${value} GLOB 'item:[0-9]*' AND substr(${value}, 6) NOT GLOB '*[^0-9]*'
+          THEN 'item:' || (SELECT id FROM maintenance_items WHERE user_id = ${userId}
+            AND import_key = ${importId + ":"} || CAST(substr(${value}, 6) AS INTEGER)) ELSE ${value} END`;
+      }
+      return value;
+    });
+    for (const chunk of jsonChunks(rows)) {
+      statements.push(db.insert(table).select(sql`SELECT ${sql.join(projections, sql`, `)} FROM json_each(${chunk}) AS incoming WHERE ${active}`));
+    }
+  }
+  for (const table of [schema.practiceScores, schema.maintenanceItems]) {
+    statements.push(db.update(table).set({ importKey: null }).where(and(eq(table.userId, userId), active)));
+  }
+  preflightImport(statements.map((statement) => statement.toSQL()));
+  const result = await db.batch(statements as [Statement, ...Statement[]]);
+  if (!(result[0] as { id: string }[]).length) throw new UserFacingError(401, "Import account is no longer available");
+  // The queue contains the exact rows removed, including concurrent uploads.
+  // Only one prompt attempt fits our portable query budget; cron handles the
+  // remainder. Cleanup failure must never turn a committed import into failure.
+  const queued = result[1] as { blobKey: string }[];
+  try {
+    if (queued.length) await attemptBlobCleanup(db, bucket, [queued[0].blobKey]);
+  } catch { console.error("Import cleanup deferred"); }
+  return { ok: true as const, counts: Object.fromEntries(Object.entries(data).map(([name, rows]) =>
+    [name, Array.isArray(rows) ? rows.length : rows ? 1 : 0])) };
 }

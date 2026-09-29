@@ -20,13 +20,13 @@ describe("POST /api/auth/bootstrap", () => {
 
     const cookie = sessionCookie(response);
     expect(response.headers.get("set-cookie")).toMatch(/HttpOnly/);
-    expect(response.headers.get("set-cookie")).toMatch(/SameSite=Lax/);
+    expect(response.headers.get("set-cookie")).toMatch(/SameSite=Strict/);
     expect(response.headers.get("set-cookie")).toMatch(/Path=\//);
     expect(response.headers.get("set-cookie")).not.toMatch(/Secure/); // plain http in tests
 
     const stored = await userRow(user.id);
     expect(stored).toMatchObject({ username: "first-coach", role: "coach", is_owner: 1, invited_by: null });
-    expect(stored?.password_hash).toMatch(/^pbkdf2\$210000\$/);
+    expect(stored?.password_hash).toMatch(/^pbkdf2\$100000\$/);
     expect(stored?.password_hash).not.toContain(DEFAULT_PASSWORD);
 
     expect((await apiJson<{ setupRequired: boolean }>("/api/auth/status")).body).toEqual({ setupRequired: false });
@@ -36,7 +36,7 @@ describe("POST /api/auth/bootstrap", () => {
   it("sets the Secure cookie flag when the request came over https", async () => {
     const response = await SELF.fetch("https://example.com/api/auth/bootstrap", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", origin: "https://example.com" },
       body: JSON.stringify(credentials("secure-coach")),
     });
     expect(response.status).toBe(201);

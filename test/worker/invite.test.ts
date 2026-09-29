@@ -21,7 +21,7 @@ describe("POST /api/auth/invites", () => {
     const { status, body } = await apiJson<{ token: string; invitePath: string; expiresInHours: number }>("/api/auth/invites", { json: {}, cookie: owner.cookie });
     expect(status).toBe(201);
     expect(body.token).toMatch(/^[0-9a-f]{64}$/);
-    expect(body.invitePath).toBe(`/invite/${body.token}`);
+    expect(body.invitePath).toBe(`/invite#${body.token}`);
     expect(body.expiresInHours).toBe(24);
 
     const row = await inviteRowFor(body.token);
@@ -229,6 +229,7 @@ describe("POST /api/auth/accept-invite", () => {
     expect(await countRows("users")).toBe(2);
     expect(await countRows("users", "role = 'athlete'")).toBe(1);
     expect((await userRow(winner.id))!.username).toBe(winner.username);
+    expect(await env.DB.prepare("SELECT deactivated_at FROM users WHERE id = ?").bind(winner.id).first()).toEqual({ deactivated_at: null });
     expect(await countRows("sessions")).toBe(2);
     expect((await inviteRowFor(token))!.used_at).toEqual(expect.any(Number));
   });
@@ -287,17 +288,15 @@ describe("POST /api/auth/accept-invite", () => {
   });
 
   it("an invite that expires between the pre-read and the batch is refused and creates no user", async () => {
-    // Set expiry before reading, then delay submission across the deadline.
+    // Expire the persisted invite after the pre-read but before the claim,
+    // using SQL rather than relying on hashing crossing a wall-clock deadline.
     const owner = await bootstrapCoach("owner");
     const token = await createInvite(owner);
-    const expiry = Date.now() + 1000;
-    await setInviteExpiry(token, expiry);
     const real = getDb(env.DB);
     const realBatch = real.batch.bind(real);
     const db = Object.assign(Object.create(real) as Db, {
       async batch(statements: never) {
-        await new Promise((resolve) => setTimeout(resolve, Math.max(0, expiry - Date.now()) + 50));
-        expect(Date.now()).toBeGreaterThan(expiry);
+        await setInviteExpiry(token, 0);
         return realBatch(statements);
       },
     });
@@ -306,10 +305,9 @@ describe("POST /api/auth/accept-invite", () => {
     expect(await countRows("users")).toBe(1);
     expect((await inviteRowFor(token))!.used_at).toBeNull();
 
-    // Same through the API: the invite expires a few ms after creation, so it
-    // is either caught by the pre-read or by the batch; both must be 410.
+    // An already expired token must also be rejected by the HTTP route.
     const token2 = await createInvite(owner);
-    await setInviteExpiry(token2, Date.now() + 5);
+    await setInviteExpiry(token2, 0);
     const { status } = await apiJson("/api/auth/accept-invite", { json: { token: token2, ...credentials("too-late-2") } });
     expect(status).toBe(410);
     expect(await countRows("users")).toBe(1);
@@ -330,6 +328,25 @@ describe("POST /api/auth/accept-invite", () => {
     // The athlete invited earlier by the deleted coach keeps working and the team still sees them.
     expect((await api("/api/auth/me", { cookie: team.athleteB.cookie })).status).toBe(200);
     expect((await userRow(team.athleteB.user.id))!.invited_by).toBeNull();
+  });
+
+  it("D1 execution-time expiry rejects a claim carrying a stale application timestamp", async () => {
+    const owner = await bootstrapCoach("owner");
+    const token = await createInvite(owner);
+    const databaseNow = await env.DB.prepare("SELECT CAST(strftime('%s', 'now') AS INTEGER) * 1000 AS now").first<number>("now");
+    expect(databaseNow).not.toBeNull();
+    // At the mocked application time this invite is valid. At database
+    // execution time it expired yesterday. This independently proves the SQL
+    // clock check (not merely expires_at > the timestamp sent by the caller).
+    await setInviteExpiry(token, databaseNow! - 24 * HOUR);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(databaseNow! - 48 * HOUR);
+      const result = await acceptInviteService(getDb(env.DB), { token, ...credentials("stale-clock") });
+      expect(result.status).toBe("not-claimable");
+      expect(await countRows("users")).toBe(1);
+      expect((await inviteRowFor(token))!.used_at).toBeNull();
+    } finally { vi.useRealTimers(); }
   });
 
   it("an athlete invite created by the owner is still accepted after the owner was deleted", async () => {

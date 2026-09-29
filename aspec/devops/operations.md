@@ -4,25 +4,25 @@
 
 Installation:
 
-- Use the [README quick start](../../README.md#quick-start) to install dependencies, authenticate Wrangler, create D1/R2 and replace the placeholder `database_id` values. Resource names/bindings are in [infrastructure](infrastructure.md#architecture).
+- Follow the [README quick start](../../README.md#quick-start) for dependencies, Wrangler authentication, D1/R2 provisioning and placeholder database IDs. [Infrastructure](infrastructure.md#architecture) owns binding names.
 
 Setup and run:
 
-- Apply migrations to the intended environment, build the SPA, then run/deploy the Worker. Fresh databases have no seeded account; follow [first run](../../README.md#first-run-accounts-roles-invites).
-- The [hosted password-hashing blocker](../architecture/security.md#api-security) remains until work item 0002. A successful build/deploy does not establish that hosted signup/login works.
+- Apply migrations, build and deploy the matching backend/frontend. Fresh databases have no seeded account; follow [first run](../../README.md#first-run-accounts-roles-invites). For upgrades with uploads, use the gated rollout below.
+- Local success is not hosted verification. The [required preview checks](../../README.md#verification-status) are partially verified; hosted R2/Cron and physical installed-PWA checks remain.
 
 Environment variables:
 
-- None required by the application today. `DB` and `ATTACHMENTS` are resource bindings, not string environment variables. CI/tooling sets `WRANGLER_SEND_METRICS=false`.
+- No application string variables are required in deployment. D1, R2 and Rate Limiting are resource bindings. `RATE_LIMIT_MODE` is an explicit local/test mock only; never configure it in preview/production. CI/tooling sets `WRANGLER_SEND_METRICS=false`.
 
 Secrets:
 
-- No Worker secrets today. Work item 0002 adds bindings rather than a bootstrap secret; the public-bootstrap risk remains accepted. If a future change introduces a Worker secret, provision it using `npx wrangler secret put SECRET_NAME` (production) and `npx wrangler secret put SECRET_NAME --env preview`, and document the real name here then.
-- GitHub environment secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` belong separately to `preview` and `production`. The token needs account-scoped Workers Scripts: Edit, D1: Edit and Workers R2 Storage: Edit for deploy/migration/binding validation. These are CI credentials, not Worker bindings. Local operators authenticate with `wrangler login`.
+- No Worker secrets are required. Public bootstrap remains an accepted risk under [security](../architecture/security.md#secrets).
+- GitHub Actions needs no Cloudflare credentials: CI only checks and builds. Cloudflare (Workers Builds) deploys with credentials managed in the Cloudflare dashboard; if its build/deploy command also applies migrations, its token needs D1: Edit. Local operators use `wrangler login`.
 
 ## Environments
 
-Preview and production run the same application with independent storage. Top-level Wrangler configuration is production; `--env preview` selects preview. The [workflow behavior](cicd.md#pipelines) defines automation and approval.
+Preview and production have independent storage and limiter namespaces. Top-level Wrangler configuration is production; `[previews]` configures Preview deployments of the same Worker, created with `wrangler preview`. D1 commands reach the preview database with `--preview` (`execute`, `migrations apply`) or by its name `dogoodarching-preview` (`export`). See [CI/CD](cicd.md#pipelines) for automation.
 
 | Target | Apply migrations | Build and deploy |
 |---|---|---|
@@ -30,64 +30,101 @@ Preview and production run the same application with independent storage. Top-le
 | Preview | `npm run db:migrate:preview` | `npm run deploy:preview` |
 | Production | `npm run db:migrate` | `npm run deploy` |
 
-Direct deploy scripts do not migrate or require GitHub approval. Routine releases use CI, which supplies the SHA tag and applies migrations first.
+Cloudflare performs routine deploys; the deploy scripts are for manual deploys. Neither migrates: apply the matching migrations first (or make Cloudflare's deploy command do so). Nothing automates the upload gate/drain or backups below.
 
 ## Ongoing operations
 
 Version upgrades/downgrades:
 
-- Change dependencies and the lockfile together; review compatibility before changing `compatibility_date`. Run typecheck, lint, tests, schema check and build, then deploy to preview and exercise hosted auth, uploads and the PWA before production.
-- Worker rollback to an earlier SHA does not reverse database migrations or R2 changes. Confirm schema compatibility first; prefer a corrective forward migration over editing history.
+- Change dependencies and lockfile together; review compatibility-date changes. Run typecheck, lint, docs/schema checks, tests and build, then exercise hosted preview before production.
+- Worker rollback does not reverse D1/R2 changes. Confirm schema compatibility and prefer corrective forward migrations. Do not restore the old base64 uploader with upload traffic enabled: it creates uncounted files.
 
 Database migrations:
 
-1. Edit `src/db/schema.ts`, then run `npm run db:generate` (drizzle-kit with SQLite/d1-http). Commit the reviewed new SQL and `migrations/meta` snapshot/journal together. Never edit an applied migration.
-2. Review generated SQL, especially table rebuilds, FK cascades, data copying and D1 limits. Existing migrations are `0001_init.sql` and `0002_team_auth.sql`. The second uses deferred FK checks, preserves valid rows and score ends, discards user-owned orphan rows, nulls broken inviter references, marks the earliest existing coach owner, and removes `entries`. Existing program states stay unchanged; missing states are backfilled to 24 lb / cycle 2 / week 6 with a migration-time anchor, preserving the old display at migration time. New accounts use the neutral default.
-3. Run `npm run db:check`. This invokes generation and fails if migration bytes change; it does not apply migrations. Apply locally with `npm run db:migrate:local` and run migration/integration tests against empty and seeded legacy schemas. Inspect a copy of populated data before destructive upgrades.
-4. Back up the remote database before applying changes, for example `npx wrangler d1 export DB --remote --env preview --output preview-before-migration.sql`, or `npx wrangler d1 export DB --remote --output production-before-migration.sql`. Keep exports outside version control and protect them as account data.
-5. Apply to preview first (CI does this on a merge/push to `main`), verify, then use the manual production workflow. Both workflows run migration commands before Worker deployment. They do **not** automate the backup step.
-6. After migration, verify `PRAGMA foreign_key_check`, account access, program state and attachment metadata against expected results. Restore/recovery is described below.
+1. Edit `src/db/schema.ts`, generate with `npm run db:generate`, and commit reviewed SQL plus snapshots/journal. Never edit applied migrations.
+2. Review rebuilds, FK cascades, data copying and D1 limits. `0002_team_auth.sql` preserves valid rows/score ends, removes user-owned orphans and `entries`, nulls broken inviter references and chooses the earliest coach as owner. Existing program anchors stay; missing states are backfilled to 24 lb / cycle 2 / week 6 at migration time. New accounts use neutral defaults. Later migrations are `0003_drop_rate_limits.sql`, `0004_lifecycle.sql`, `0005_upload_accounting.sql` and `0006_import_mapping.sql`; see [schema summary](../architecture/design.md#data-model-summary).
+3. Run `npm run db:check` (generation/no drift, not migration execution), apply locally, and test empty and populated legacy schemas.
+4. Back up before remote changes, e.g. `npx wrangler d1 export dogoodarching-preview --remote --output preview-before-migration.sql` (use `dogoodarching` for production). Protect exports outside version control.
+5. Apply/verify preview first, then production, before the code that needs the new schema is deployed. CI does not apply migrations, make backups or coordinate old upload writers.
+6. Inspect `PRAGMA foreign_key_check`, account access, program state and attachment metadata after migration.
+
+**Attachment size backfill and rollout ordering:**
+
+1. Temporarily gate file-upload routes at the deployment edge and drain old in-flight uploads. Apply migration 0005 before deploying the new code; existing attachment sizes become NULL.
+2. Deploy matching backend and raw-file frontend together. Ensure no old Worker version can accept uploads before running backfill. Other operations need not be gated.
+3. Allow the scheduled job to run `backfillAttachmentSizes` from `services/attachments.ts`, or invoke it in a trusted Worker context. There is no public/admin backfill endpoint. Each scheduled run heads at most 50 unknown non-link objects; explicit function limits clamp to 1–100. NULL/oldest `size_checked_at`, then ID, determine retry order. Conditional ID/key/NULL updates make retries resumable and idempotent.
+4. Inspect progress with the query below. `head().size` is authoritative, including a confirmed zero-byte legacy object. Missing/invalid/failed heads stay NULL, never zero; retries rotate so they do not starve untouched rows. Restore missing blobs or delete unavailable attachments through the normal endpoint. Backfill never silently removes user rows.
+5. Remove the temporary gate once old writers are drained. Enforcement is always on: any target with unknown/negative accounting cannot upload. Targets become eligible as backfill completes; those already above quota must delete files. Reads/deletes/links remain available. [Security](../architecture/security.md#file-attachments) owns the quota values.
+
+```sql
+SELECT user_id, count(*) AS unknown_files
+FROM planned_session_attachments
+WHERE kind != 'link' AND size_bytes IS NULL
+GROUP BY user_id;
+```
 
 ## Backups & restore
 
-D1 SQL export is the explicit pre-change backup. D1 Time Travel is the remote point-in-time recovery facility; use Wrangler's `d1 time-travel info` and `restore` commands with the selected environment and an inspected timestamp/bookmark. Confirm the account's available recovery window before relying on a restore; the repo defines no retention policy. A restore changes the whole selected database, so coordinate it with the deployed Worker/schema version.
+D1 SQL export is the explicit pre-change backup. D1 Time Travel provides remote point-in-time recovery; inspect the selected environment's timestamp/bookmark and available recovery window before using Wrangler `d1 time-travel info`/`restore`. The repository defines no retention policy. A restore affects the whole database and must match the deployed schema/code.
 
-R2 bytes need their own backup/recovery process: neither D1 Time Travel nor the app JSON export includes them. No R2 backup job, retention schedule or restore automation exists in this repository. A usable file restore must match D1 `blob_key` references to the restored R2 objects. Keep a copy of file bytes before operations that remove/replace them. See [current import ordering](../architecture/design.md#component-6) before importing over data with uploads.
+R2 bytes require a separate backup: neither D1 recovery nor JSON export includes them. No R2 backup/restore automation exists. Restored bytes must match D1 `blob_key` references. Keep file copies before intentional replacement/deletion. Imports now preserve referenced files on D1 rollback and use durable post-commit cleanup; successful replacement still intentionally removes old file attachments.
 
 ## Logs
 
-Use `npx wrangler tail` for production or `npx wrangler tail --env preview` for preview. Use Cloudflare Workers Logs when enabled in the account; no `[observability]` configuration is declared here. The global error handler logs `Unhandled error` with `console.error`. There is no application alerting or logging retention configuration. Invite tokens are currently in URL paths; the [planned fragment/header changes](../architecture/security.md#planned-work-item-0002) address that exposure.
+Use `npx wrangler tail` for production; `wrangler tail` has no preview option, so use the Cloudflare dashboard for Preview deployment logs. No `[observability]`, application alerting or log-retention policy is configured. Global/upload error boundaries log fixed events; the [error-leakage policy and server-side exceptions](../architecture/security.md#secrets) describe what is retained. Scheduled runs log count summaries or `scheduled cleanup failed`. New [fragment invitations](../architecture/security.md#api-security) keep tokens out of request paths; old path links can still appear in initial access logs.
 
 ## Admin runbook
 
-The app has no password-change or recovery endpoint today. A Cloudflare/D1 operator can manually replace a password hash and revoke that user's sessions. App owner status alone does not grant this database access.
+Settings supports password change with the current password and sign out everywhere. Forgotten passwords and unsupported 210k hashes require this operator reset; application ownership alone does not grant D1 access. The reset changes only the credential and sessions, preserving role, owner flag and training data (and leaving deactivation unchanged).
 
-1. Back up the chosen database. Identify the exact user UUID with a read-only `wrangler d1 execute DB --remote --command "SELECT id, username, role, is_owner FROM users"` (add `--env preview` for preview).
-2. Generate a hash locally with the checked-out application's `hashPassword`, so it matches the verifier. With Node 22, from the repository root:
+1. Back up the chosen database and identify the exact UUID:
+
+   ```bash
+   npx wrangler d1 execute DB --remote --command "SELECT id, username, role, is_owner, substr(password_hash, 1, 14) AS hash_prefix FROM users"
+   ```
+
+   Add `--preview` for the preview database or use `--local` instead of `--remote`. `pbkdf2$210000$` needs reset; `pbkdf2$100000$` is the current format. All supported counts/encoding lengths are in [security](../architecture/security.md#api-security); there is no local-only 210k exception.
+
+2. Generate using the checked-out `hashPassword` (new password 8–128 characters). From the repository root with Node 22:
 
    ```bash
    read -r -s -p 'New password: ' DGA_RESET_PASSWORD
    export DGA_RESET_PASSWORD
    node --experimental-strip-types --input-type=module <<'JS'
    import { hashPassword } from './src/lib/auth.ts';
-   console.log(await hashPassword(process.env.DGA_RESET_PASSWORD));
+   const password = process.env.DGA_RESET_PASSWORD;
+   if (!password || password.length < 8 || password.length > 128) throw new Error('Password must be 8–128 characters');
+   console.log(await hashPassword(password));
    JS
    unset DGA_RESET_PASSWORD
    ```
 
-3. Put the resulting hash and the verified UUID into a local SQL file (replace `GENERATED_HASH` and `USER_UUID`, retaining the SQL single quotes):
+   Confirm output starts `pbkdf2$100000$`: PBKDF2-HMAC-SHA256, 16-byte salt and 32-byte hash in standard padded base64. Do not paste plaintext passwords into SQL or shell command arguments.
+
+3. Put the generated hash and verified UUID into one local SQL file, retaining SQL single quotes. Execute both statements together:
 
    ```sql
    UPDATE users SET password_hash = 'GENERATED_HASH' WHERE id = 'USER_UUID';
    DELETE FROM sessions WHERE user_id = 'USER_UUID';
    ```
 
-4. Run `npx wrangler d1 execute DB --remote --file /path/to/reset.sql`, adding `--env preview` for preview, or use `--local` instead of `--remote` for local recovery. Verify the selected row was updated and sessions removed, test login, then remove the temporary hash/SQL file. The current hosted hashing blocker still applies; changing only the stored hash cannot fix it.
-
-**Planned (work item 0002):** self-service password change with the current password, sign out everywhere and account lifecycle controls, described in [experience](../uxui/experience.md#signup-and-account). Forgotten-password reset without email remains a manual operator task.
+4. Run `npx wrangler d1 execute DB --remote --file /path/to/reset.sql` with the selected environment flags. Repeat the identity/prefix query: verify the intended user's new prefix and unchanged `role`/`is_owner`. Confirm `SELECT count(*) FROM sessions WHERE user_id = 'USER_UUID';` is zero and training rows remain. Test login with the new password; ask the user to change it in Settings (`POST /api/auth/password`). Remove the temporary hash/SQL file. The local password-hash suite exercises this reset and owner preservation; it does not prove hosted login.
 
 ## Scheduled cleanup jobs
 
-No Cron Trigger or `scheduled` handler exists today. Sessions and used/expired invites are not periodically purged. Rate-limit windows reset on the next request for that key; inactive buckets are not periodically purged.
+The [production Cron Trigger](infrastructure.md#architecture) (preview has none) invokes `src/index.ts`'s `scheduled` export, which uses `waitUntil(runScheduledCleanup(...))` with the trigger's scheduled time. Each run is bounded:
 
-**Planned (work item 0002):** Cron Triggers in preview and production will delete expired sessions and invitations used or expired for more than 30 days. No trigger schedule is defined yet. The hardening item also calls for handling partial R2 deletion failures during account cleanup; no such retry job exists today.
+1. Delete sessions with `expires_at <= now`, at most 500 rows per statement for 20 rounds.
+2. Delete invites used at least 30 days ago, or still unused and expired at least 30 days ago, with the same bounds (inclusive cutoff).
+3. Process at most 100 due `blob_cleanup` records, oldest deadline/key first. Never delete a currently referenced attachment or a live upload lease. Expired reservations are fenced by setting expiry to zero before R2 deletion. Ordinary cleanup records are removed only after successful R2 deletion; currently referenced keys drop their redundant cleanup record. Failures increment attempts, retain diagnostics and retry after `min(15 minutes × attempts, 24 hours)`.
+4. Run the bounded size backfill described above and report updated/missing/failed counts.
+
+Account/attachment deletion and import replacement write cleanup records in the same D1 operation that removes references, then attempt R2 deletion after commit. Import attempts one queued blob promptly to stay within its conservative invocation budget; cron handles the rest. Records have no user FK and survive account deletion. Settled failed uploads release reservations and attempt cleanup; abandoned expired uploads retain reservation/cleanup tombstones and retry successful deletes daily indefinitely. Do not prune tombstones just because a blob is missing or a delete succeeded: a late R2 put can otherwise become untracked.
+
+For a local trigger, run `npx wrangler dev --test-scheduled`, then:
+
+```bash
+curl 'http://localhost:8787/__scheduled?cron=*/15+*+*+*+*'
+```
+
+Inspect count summaries and the private queue for persistent failures. This local trigger is not hosted Cron verification.

@@ -11,7 +11,7 @@ function show(element: React.ReactNode) {
   return render(<QueryClientProvider client={client}>{element}</QueryClientProvider>);
 }
 beforeEach(() => {
-  vi.spyOn(api, "listAthletes").mockResolvedValue({ athletes: [{ id: "athlete", username: "shared-athlete", createdAt: "2026-09-28T12:00:00Z" }] });
+  vi.spyOn(api, "listAthletes").mockResolvedValue({ athletes: [{ id: "athlete", username: "shared-athlete", createdAt: "2026-09-28T12:00:00Z", deactivatedAt: null }] });
   vi.spyOn(api, "listCoaches").mockResolvedValue({ coaches: [{ ...coach, createdAt: "2026-09-28T12:00:00Z" }] });
   vi.spyOn(api, "listInvites").mockResolvedValue([]);
 });

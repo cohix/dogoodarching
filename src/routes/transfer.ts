@@ -5,7 +5,7 @@ import { getDb } from "../db";
 import { buildContentDisposition, validateJson } from "../lib/http";
 import { authMiddleware, type AppBindings } from "../lib/rbac";
 import { importPayloadSchema } from "../lib/validation";
-import { exportFilename, exportUserData, importUserData } from "../services/transfer";
+import { exportFilename, exportUserData, importUserData, MAX_IMPORT_BYTES } from "../services/transfer";
 
 const transfer = new Hono<AppBindings>();
 
@@ -21,7 +21,7 @@ transfer.get("/export", async (c) => {
   });
 });
 
-transfer.post("/import", validateJson(importPayloadSchema), async (c) => {
+transfer.post("/import", validateJson(importPayloadSchema, MAX_IMPORT_BYTES), async (c) => {
   return c.json(await importUserData(getDb(c.env.DB), c.env.ATTACHMENTS, c.get("user").id, c.req.valid("json").data));
 });
 

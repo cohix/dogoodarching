@@ -8,9 +8,13 @@
  * exist in the next. Do the bootstrap/login inside the test (or in a
  * `beforeEach`), not in `beforeAll`.
  *
- * Rate limits live in the `rate_limits` table and are keyed by client IP
- * (constant in tests), so they reset with every test too; a single test that
- * issues more than 20 logins or 10 bootstraps will hit 429.
+ * Rate limits use Workers Rate Limiting bindings, which vitest.config.ts
+ * replaces with the test-only `RATE_LIMIT_MODE = "allow"` mock, so no suite
+ * hits 429 however many logins it issues. Tests that need the deny/error
+ * paths set `env.RATE_LIMIT_MODE` themselves (see auth-rate-limit.test.ts).
+ * There is no `rate_limits` table any more; `resetStorage` empties whatever
+ * tables the migrations create, including `blob_cleanup` (0004), so a test
+ * that queues R2 deletions never leaks records into the next test.
  */
 import { SELF, env } from "cloudflare:test";
 
@@ -51,6 +55,8 @@ export interface RequestOptions {
   /** Raw body (e.g. FormData for file uploads); ignored when `json` is set. */
   body?: BodyInit;
   headers?: Record<string, string>;
+  /** Defaults to BASE_URL; null removes Origin; a string overrides it. */
+  origin?: string | null;
   /** Session cookie from `bootstrapCoach` / `login` / `acceptInvite`. */
   cookie?: string;
 }
@@ -58,6 +64,8 @@ export interface RequestOptions {
 /** Issue a request against the Worker. Paths are relative, e.g. `/api/auth/status`. */
 export async function api(path: string, options: RequestOptions = {}): Promise<Response> {
   const headers = new Headers(options.headers);
+  if (options.origin === null) headers.delete("origin");
+  else if (options.origin !== undefined || !headers.has("origin")) headers.set("origin", options.origin ?? BASE_URL);
   let body: BodyInit | undefined = options.body;
   if (options.json !== undefined) {
     headers.set("content-type", "application/json");
@@ -161,4 +169,15 @@ export async function bootstrapTeam(): Promise<{ coach: Session; athlete: Sessio
   const token = await createInvite(coach);
   const athlete = await acceptInvite(token, "athlete");
   return { coach, athlete };
+}
+
+/** Browser-compatible raw File upload; never sets Content-Length. */
+export function uploadFile(path: string, session: Session | undefined, metadata: Record<string, unknown> = {}, bytes = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x34, 0x0a])): Promise<Response> {
+  const { dayKey = "wed", kind = "document", label = "Plan notes", mimeType = "application/pdf" } = metadata;
+  const query = new URLSearchParams({ dayKey: String(dayKey), kind: String(kind), label: String(label) });
+  return api(path + "?" + query, {
+    method: "POST", cookie: session?.cookie,
+    headers: { "content-type": String(mimeType), "x-file-size": String(bytes.byteLength) },
+    body: new File([bytes], "upload", { type: String(mimeType) }),
+  });
 }

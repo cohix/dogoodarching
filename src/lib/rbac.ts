@@ -1,6 +1,6 @@
 import type { Context } from "hono";
 import { createMiddleware } from "hono/factory";
-import { and, eq, gt } from "drizzle-orm";
+import { and, eq, gt, isNull } from "drizzle-orm";
 import { getDb, schema, type Env } from "../db";
 import { getSessionToken, sha256Hex, type AuthUser } from "./auth";
 
@@ -14,7 +14,12 @@ export type AppBindings = {
   Variables: AuthedVariables;
 };
 
-/** Requires a valid, unexpired session cookie; loads the user or 401s. */
+/**
+ * Requires a valid, unexpired session cookie for an active (not deactivated)
+ * user; loads the user or 401s. Deactivation deletes the athlete's sessions,
+ * and this check also covers a session that a racing login might have
+ * created before that delete ran.
+ */
 export const authMiddleware = createMiddleware<AppBindings>(async (c, next) => {
   const token = getSessionToken(c.req.raw);
   if (!token) return c.json({ error: "Unauthorized" }, 401);
@@ -24,7 +29,11 @@ export const authMiddleware = createMiddleware<AppBindings>(async (c, next) => {
     .select({ sessionId: schema.sessions.id, user: schema.users })
     .from(schema.sessions)
     .innerJoin(schema.users, eq(schema.users.id, schema.sessions.userId))
-    .where(and(eq(schema.sessions.tokenHash, tokenHash), gt(schema.sessions.expiresAt, new Date())))
+    .where(and(
+      eq(schema.sessions.tokenHash, tokenHash),
+      gt(schema.sessions.expiresAt, new Date()),
+      isNull(schema.users.deactivatedAt),
+    ))
     .limit(1);
   const row = rows[0];
   if (!row) return c.json({ error: "Unauthorized" }, 401);
